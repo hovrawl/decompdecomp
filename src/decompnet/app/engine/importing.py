@@ -6,6 +6,7 @@ header, with what the console adds (more code to split, the game's own symbols, 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -27,6 +28,36 @@ DEBUG_TYPES_NOTE = """
 """
 DEBUG_TYPES_FILE = "debug_types.h"
 HEADER_CHECK = "int decomp_header_check;"  # a source that needs nothing but the header to compile
+
+
+def folder_targets(folder: Path, log=None) -> dict[consoles.Console, list[Path]]:
+    """Find startable formats using the same probes as single-file import."""
+    if not folder.is_dir():
+        raise RomError("Choose a folder to scan.")
+    groups: dict[consoles.Console, list[Path]] = {}
+    check_cancel = getattr(log, "check_cancel", lambda: None)
+    for root, dirs, files in os.walk(folder, onerror=lambda e: log(f"Could not scan: {e}") if log else None):
+        check_cancel()
+        here = Path(root)
+        dirs[:] = sorted(d for d in dirs if d not in (".git", ".decomp") and not (here / d).is_symlink()
+                         and not (here / d).is_junction())
+        for name in sorted(files):
+            check_cancel()
+            path = here / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                console = consoles.identify(path)
+            except RomError:
+                continue
+            except OSError as e:
+                if log:
+                    log(f"Could not read {path.relative_to(folder)}: {e}")
+                continue
+            groups.setdefault(console, []).append(path)
+    if not groups:
+        raise RomError("No supported decompilation targets were found in this folder.")
+    return groups
 
 
 def pair_old_functions(rows, functions) -> dict:
@@ -55,6 +86,40 @@ def pair_old_functions(rows, functions) -> dict:
 
 
 class ImportMixin:
+    def import_folder(self, folder: Path, *, separate: bool, scope: str | None, log=print) -> dict:
+        groups = folder_targets(folder, log)
+        base = f"{slugify(folder.name)}-batch"
+        parent = self.workspace / base
+        n = 2
+        while True:
+            try:
+                parent.mkdir(parents=True)
+            except FileExistsError:
+                parent = self.workspace / f"{base}-{n}"
+                n += 1
+            else:
+                break
+        projects, failures = [], []
+        check_cancel = getattr(log, "check_cancel", lambda: None)
+        log(f"Found {sum(map(len, groups.values()))} targets. New projects go in {parent}")
+        for console, files in groups.items():
+            for primary, options in console.folder_projects(folder, files, separate, log):
+                check_cancel()
+                name = primary.relative_to(folder).as_posix()
+                log(f"Importing {name} ({console.name})")
+                try:
+                    slug = console.import_game(self, primary, name=primary.name, scope=scope, log=log,
+                                               project_parent=parent / console.id, project_options=options)
+                except (RomError, NetworkError) as e:
+                    log(f"Could not import {name}: {e}")
+                    failures.append(name)
+                else:
+                    if slug not in projects:
+                        projects.append(slug)
+        if not projects:
+            raise NetworkError("No projects were imported. See the import log for details.")
+        return {"slug": projects[0], "projects": projects, "failures": failures}
+
     def import_rom(self, data: bytes | Path, *, toolchain: str | None = None, flags: list[str] | None = None,
                    confirmed: bool = False, name: str = "", log=print, scope: str | None = None,
                    options: dict | None = None) -> str:
@@ -82,10 +147,12 @@ class ImportMixin:
         return path
 
     def import_split(self, console: consoles.Console, picked: Picked, *, toolchain: str | None = None,
-                     flags: list[str] | None = None, log=print, reimport_slug: str | None = None) -> str:
+                     flags: list[str] | None = None, log=print, reimport_slug: str | None = None,
+                     project_parent: Path | None = None) -> str:
         """ROM mode: split the program `console` read from the user's file, store every function as a target."""
         if reimport_slug is None:
-            return self._import_split(console, picked, toolchain=toolchain, flags=flags, log=log)
+            return self._import_split(console, picked, toolchain=toolchain, flags=flags, log=log,
+                                      project_parent=project_parent)
         with self.progress.rebuilding(reimport_slug):
             return self._reimport_split(console, picked, toolchain=toolchain, flags=flags, log=log,
                                         reimport_slug=reimport_slug)
@@ -109,20 +176,22 @@ class ImportMixin:
             shutil.rmtree(stage, ignore_errors=True)
 
     def _import_split(self, console: consoles.Console, picked: Picked, *, toolchain: str | None = None,
-                      flags: list[str] | None = None, log=print, reimport=None, workdir: Path | None = None) -> str:
+                      flags: list[str] | None = None, log=print, reimport=None, workdir: Path | None = None,
+                      project_parent: Path | None = None) -> str:
         rom, info = picked.data, picked.info
         check_cancel = getattr(log, "check_cancel", lambda: None)
         check_cancel()
         if reimport is None:
-            for p in self.store.all("SELECT slug, config FROM projects"):
+            for p in self.store.all("SELECT slug, config FROM projects") if project_parent is None else ():
                 if json.loads(p["config"]).get("rom", {}).get("sha1") == info["sha1"]:
                     log(f"already imported as {p['slug']}")
                     return p["slug"]
             base = slugify(info["title"])
             slug, n = base, 2
-            while self.store.one("SELECT 1 FROM projects WHERE slug=?", slug) or (self.workspace / slug).exists():
+            parent = project_parent or self.workspace
+            while self.store.one("SELECT 1 FROM projects WHERE slug=?", slug) or (parent / slug).exists():
                 slug, n = f"{base}-{n}", n + 1
-            workdir = self.workspace / slug
+            workdir = parent / slug
             workdir.mkdir(parents=True)
         else:
             slug = reimport["slug"]
@@ -173,6 +242,7 @@ class ImportMixin:
             log(f"Compiler {toolchain}: {info['compiler_why']}")
         cfg = {
             "kind": "rom", "platform": console.id, "big_endian": picked.big_endian, "gp": res.gp,
+            **({"workspace_path": workdir.relative_to(self.workspace).as_posix()} if project_parent is not None else {}),
             "rom": {**info, "file": res.image or picked.filename, "program": picked.filename},
             "segments": [vars(s) for s in res.segments],
             "compiler": {"toolchain": toolchain, "flags": flags, "timeout": 20},

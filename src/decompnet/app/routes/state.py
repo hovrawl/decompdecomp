@@ -21,6 +21,7 @@ from ...forks.project import SCOPES
 from ...network import NetworkError
 from .. import cleanup, edition, picker, saves, updates
 from ..engine import COMPILERS, TOOLS
+from ..engine.importing import folder_targets
 from ..support import MAX_DISC, job_error, static_file
 from . import App
 
@@ -277,6 +278,23 @@ def register(app: App) -> None:
                 (game.parent / name).write_bytes(f.read(n))
             f.truncate(size - sum(n for _, n in wanted))
 
+    @mcp.custom_route("/api/import/folder", methods=["POST"])
+    async def api_scan_folder(request: Request) -> Response:
+        if (bad := guard(request, write=True)):
+            return bad
+        data = await body(request)
+        if not (path := str(data.get("path") or "").strip()):
+            return fail(ValueError("Choose a file or folder first."))
+        folder = hostenv.local_path(path)
+        if not folder.is_dir():
+            return JSONResponse({"folder": False}) if folder.is_file() else fail(ValueError(f"No file or folder at {folder}"))
+        try:
+            groups = await call(folder_targets, folder)
+        except ValueError as e:
+            return fail(e)
+        return JSONResponse({"folder": True, "groups": [{"platform": c.name, "count": len(files)} for c, files in groups.items()],
+                             "layout_choice": any(c.folder_has_layout_choice(files) for c, files in groups.items())})
+
     @mcp.custom_route("/api/import", methods=["POST"])
     async def api_import(request: Request) -> Response:
         """A game the user owns: the demo, an upload streamed to disk (discs are gigabytes), or a local path."""
@@ -293,6 +311,10 @@ def register(app: App) -> None:
             return fail(ValueError("options must be a JSON object of strings"))
         # every compiler of the game's console first (the proprietary ones with `accept`), so its test tries them all
         all_compilers, accept = q.get("all_compilers") == "1", q.get("accept") == "1"
+        layout = q.get("folder_layout")
+        if layout is not None and (layout not in ("combined", "separate") or q.get("confirmed") != "1" or not q.get("path")
+                                   or q.get("demo") == "1" or all_compilers):
+            return fail(ValueError("Choose a local folder and confirm ownership before starting a folder import."))
         if scope not in (None, *SCOPES):
             return fail(ValueError(f"a project covers the game's own code or the whole program, not {scope!r}"))
         if q.get("demo") == "1":
@@ -330,21 +352,27 @@ def register(app: App) -> None:
                 except ValueError as e:
                     shutil.rmtree(game.parent, ignore_errors=True)
                     return fail(e)
-        uploaded = isinstance(game, Path) and game.parent.parent == home / "uploads"
+        uploaded = q.get("demo") != "1" and not q.get("path")
 
         def work(log):
             try:
-                slug = net.import_rom(game, toolchain=toolchain, confirmed=True, name=name, log=log, scope=scope,
-                                     options=options)
+                if layout is not None:
+                    result = net.import_folder(game, separate=layout == "separate", scope=scope, log=log)
+                else:
+                    slug = net.import_rom(game, toolchain=toolchain, confirmed=True, name=name, log=log, scope=scope,
+                                         options=options)
+                    result = {"slug": slug}
             finally:
                 if uploaded:
                     shutil.rmtree(game.parent, ignore_errors=True)
+            slug = result["slug"]
             if all_compilers:
                 net.install_compilers(slug, accept, retest=toolchain is None, log=log)
             settings.data["last_project"] = slug
             settings.save()
-            autopilot(slug)
-            return {"slug": slug}
+            for imported in result.get("projects", [slug]):
+                autopilot(imported)
+            return result
         return JSONResponse({"job": jobs.start("import", work)})
 
     COLUMN_KEYS = ("vram", "cc", "ccx")

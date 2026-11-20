@@ -144,10 +144,20 @@ class WindowsPC(Console):
     def default_compiler(self, info: dict, splat_guess: str) -> str:
         return ""  # the program's Rich header says which Visual C++ built it (scratch.guess_compiler)
 
-    def create_project(self, root: Path, game: Path, *, compiler: str | None = None, log=print) -> dict:
+    def folder_has_layout_choice(self, files: list[Path]) -> bool:
+        return sum(path.suffix.lower() == ".exe" for path in files) > 1
+
+    def folder_projects(self, folder: Path, files: list[Path], separate: bool, log) -> list[tuple[Path, dict]]:
         from . import scratch
 
-        return scratch.create(root, game, compiler=compiler, log=log, args=self.tool_args())
+        return scratch.folder_projects(folder, files, separate, log)
+
+    def create_project(self, root: Path, game: Path, *, compiler: str | None = None, log=print,
+                       source_folder: Path | None = None, companions: tuple[Path, ...] = ()) -> dict:
+        from . import scratch
+
+        return scratch.create(root, game, compiler=compiler, log=log, args=self.tool_args(),
+                              source_folder=source_folder, companions=companions)
 
     def game_info(self, game: Path) -> dict:
         from . import scratch

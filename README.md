@@ -106,6 +106,10 @@ Type `decomp`, or open decompdecomp from your apps menu. It opens in its own win
 
 No whole game has been decompiled yet. The export uses matched C and assembly for the rest, so it still builds the game.
 
+**Import a folder.** Choose **Use a file path or scan a folder** to find supported files in the folder and its subfolders.
+New projects share one output folder, grouped by platform. When the scan finds multiple Windows EXEs, you can combine
+compatible EXEs and DLLs or create a subproject for each EXE.
+
 ## Platforms
 
 | Console | Status | Start from |

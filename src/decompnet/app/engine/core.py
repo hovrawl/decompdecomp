@@ -97,8 +97,11 @@ class Core(Network):
         folder copied to another computer, user name or Linux keeps its projects (their folders were stored as
         absolute paths: /home/decomp/Decomp/... inside the old Windows install's WSL)."""
         moved = []
-        for row in self.store.all("SELECT id, slug, root FROM projects"):
-            here = self.workspace / row["slug"]
+        for row in self.store.all("SELECT id, slug, root, config FROM projects"):
+            relative = Path(json.loads(row["config"]).get("workspace_path", row["slug"]))
+            if relative.anchor or ".." in relative.parts:
+                continue
+            here = self.workspace / relative
             if row["root"] and not Path(row["root"]).exists() and here.is_dir():
                 with self.store.tx() as db:
                     cfg = json.loads(db.execute("SELECT config FROM projects WHERE id=?", (row["id"],)).fetchone()["config"])

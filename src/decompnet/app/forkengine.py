@@ -794,9 +794,10 @@ class ForkEngine:
         log(f"cloned into {dest} ({kind} project)")
         return slug
 
-    def _free_slug(self, base: str) -> str:
+    def _free_slug(self, base: str, parent: Path | None = None) -> str:
         slug, n = base, 2
-        while self.net.store.one("SELECT 1 FROM projects WHERE slug=?", slug) or (self.net.workspace / slug).exists():
+        parent = parent or self.net.workspace
+        while self.net.store.one("SELECT 1 FROM projects WHERE slug=?", slug) or (parent / slug).exists():
             slug, n = f"{base}-{n}", n + 1
         return slug
 
@@ -809,7 +810,7 @@ class ForkEngine:
             self.net._event(db, pid, None, "fork", event)
 
     def create_scratch(self, game: Path, console: consoles.Console, *, compiler: str | None = None, log=print,
-                       scope: str | None = None, options: dict | None = None) -> str:
+                       scope: str | None = None, options: dict | None = None, project_parent: Path | None = None) -> str:
         """A game of a PROJECT-mode console (GameCube, Wii, PC, DS), from scratch: the console generates the
         community's kind of project for it (Console.create_project: dtk-template; for PC, decompdecomp's own from
         Ghidra's analysis; for DS, ds-decomp's), opened like a fork. `scope`: what the project covers (SCOPES), for
@@ -820,12 +821,14 @@ class ForkEngine:
         scoped = {"scope": scope or GAME} if console.sets_aside else {}
         info = console.game_info(game)
         sha1 = info["sha1"]
-        for p in self.net.store.all("SELECT slug, config FROM projects"):
+        for p in self.net.store.all("SELECT slug, config FROM projects") if project_parent is None else ():
             if json.loads(p["config"]).get("program_sha1") == sha1:
                 log(f"already set up as {p['slug']}")
                 return p["slug"]
-        slug = self._free_slug(_slug(f"{info['title']} {info['id']}" if info.get("kind") != "dol" else info["title"]))
-        dest = self.net.workspace / slug
+        slug = self._free_slug(_slug(f"{info['title']} {info['id']}" if info.get("kind") != "dol" else info["title"]),
+                               project_parent)
+        dest = (project_parent or self.net.workspace) / slug
+        dest.parent.mkdir(parents=True, exist_ok=True)
         try:
             facts = console.create_project(dest, game, compiler=compiler, log=log, **scoped, **(options or {}))
             if scoped:  # (before the first measuring, which reads it)
@@ -836,6 +839,7 @@ class ForkEngine:
         cfg = {"kind": "fork", "origin": "scratch", "repo_url": None, "platform": facts["platform"],
                "version": facts["id"], "fork_kind": "manifest", "ready": False, "compiler": facts["compiler"],
                "program_sha1": sha1,
+               **({"workspace_path": dest.relative_to(self.net.workspace).as_posix()} if project_parent is not None else {}),
                "legal": {"basis": "personal-copy", "license": "personal use only",
                          "statement": "imported by the owner of this copy of the game, who confirmed it was legally obtained",
                          "confirmed_at": time.time()}}

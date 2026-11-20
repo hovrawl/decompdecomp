@@ -236,11 +236,18 @@ different build, which is planned.
   started, and the import says why. Visual C++ 2017 (32- and 64-bit) runs through wine on Linux and macOS, which you
   install. decompdecomp never removes or gets around DRM. An individual `.dll` can also be opened as its own project;
   other DLLs beside it aren't included. A game that keeps code in DLLs of its own comes with them when
-  you give its path (the game's folder, or its .exe; a dropped file comes alone): each DLL is a program of the project,
+  you give the .exe path (a dropped file comes alone): each DLL is a program of the project,
   with its source files in `src/auto/<its name>/`, its exports' names and its own Visual C++. The C runtime, DirectX
   wrappers, middleware (Miles, Bink, FMOD...), copy protection, ASI plugins and DLLs built long after the game (mods)
   are left out, and the import's log says which and why. [VISUAL-CPP.md](VISUAL-CPP.md) lists the Visual C++ builds
   decompdecomp has, how it picks one, and where their code changes.
+
+**Folder import.** The path picker scans the selected folder and its subfolders for the same formats as single-file
+import. Projects are written under `<folder>-batch/<platform>/` in your decompdecomp workspace. A DLL-only folder
+can become one Windows project. When there are multiple EXEs, choose a combined Windows project or a separate one
+for each EXE. In separate mode, DLLs go with the nearest EXE folder at or above the DLL (first EXE in scan order if
+there is more than one there); unassigned DLLs form their own group. Different architectures and overlapping fixed
+image addresses require separate projects even in combined mode. Other platforms keep one project per target.
 
 Please [report problems](https://github.com/n-delic/decompdecomp/issues). The status of a public decomp is the status of its own project.
 
