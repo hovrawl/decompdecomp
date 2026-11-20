@@ -177,18 +177,21 @@ class Console:
         return False
 
     def import_game(self, net, file: bytes | Path, *, toolchain: str | None = None, flags: list[str] | None = None,
-                    name: str = "", log=print, scope: str | None = None, options: dict | None = None) -> str:
+                    name: str = "", log=print, scope: str | None = None, options: dict | None = None,
+                    project_parent: Path | None = None, project_options: dict | None = None) -> str:
         """Start a project from the user's own copy of the game; returns its slug. The mode's way by default.
         `scope`: what the project covers, where the console sets library code aside (`sets_aside`); else ignored.
         `options`: answers to `import_options` (others are ignored)."""
         if self.mode == ROM:
-            return net.import_split(self, self.read_game(file, name), toolchain=toolchain, flags=flags, log=log)
+            return net.import_split(self, self.read_game(file, name), toolchain=toolchain, flags=flags, log=log,
+                                    **({"project_parent": project_parent} if project_parent is not None else {}))
         if self.mode == PROJECT:
             path = Path(file) if isinstance(file, (str, Path)) else net.saved_file(file, name or self.upload_name(file))
             known = toolchain if toolchain in {c.id for c in self.compilers} else None  # (a ROM console's id: not ours)
             chosen = {k: v for k, v in (options or {}).items() if k in {o[0] for o in self.import_options}}
             return net.forks.create_scratch(path, self, compiler=known, log=log,
-                                            scope=scope if self.sets_aside else None, options=chosen)
+                                            scope=scope if self.sets_aside else None, options={**chosen, **(project_options or {})},
+                                            **({"project_parent": project_parent} if project_parent is not None else {}))
         raise RomError(f"{self.name or 'these'} games can't be started from scratch in this version: continue a public "
                        "decomp of the game instead")
 
@@ -200,6 +203,13 @@ class Console:
         """The game's file in a folder the user pointed at, when this console's games are folders (a PC game's .exe
         and its DLLs); None: not one of its games."""
         return None
+
+    def folder_has_layout_choice(self, files: list[Path]) -> bool:
+        return False
+
+    def folder_projects(self, folder: Path, files: list[Path], separate: bool, log) -> list[tuple[Path, dict]]:
+        """One project per target unless the console can analyse several files together."""
+        return [(file, {}) for file in files]
 
     # ROM mode
 
@@ -722,7 +732,7 @@ def game_in(folder: Path) -> Path:
     """The game's file in a folder the user pointed at (Console.program_in), or a RomError saying there's none."""
     found = next((path for console in startable() if (path := console.program_in(folder)) is not None), None)
     if found is None:
-        raise RomError(f"{folder} holds no game file decompdecomp starts from a folder (a Windows game's .exe): "
+        raise RomError(f"{folder} holds no game file decompdecomp starts from a folder (a Windows .exe or .dll): "
                        "pick the game's file itself")
     return found
 

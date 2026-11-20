@@ -321,6 +321,54 @@ def test_import_demo_and_follow_it_live(app):
     assert "glabel" in detail["asm"]
 
 
+def test_folder_preview_and_batch_job_group_targets_by_platform(app, tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from decompnet import consoles
+    from decompnet.rom import RomError
+    from tests.test_pc import _tiny_program
+
+    client, net, _ = app
+    (tmp_path / "nested").mkdir()
+    for name in ("one.exe", "nested/two.exe", "nested/library.dll"):
+        (tmp_path / name).write_bytes(_tiny_program(b"\xc3", 0x400000, dll=name.endswith(".dll")))
+    demo = Path(__file__).resolve().parents[1] / "src/decompnet/app/static/demo/demo-quest-64.z64"
+    shutil.copyfile(demo, tmp_path / "nested/game.z64")
+    (tmp_path / "notes.txt").write_text("not a binary")
+    headers = {"X-Decomp": "1"}
+    preview = client.post("/api/import/folder", json={"path": str(tmp_path)}, headers=headers)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["layout_choice"]
+    assert {g["platform"]: g["count"] for g in preview.json()["groups"]} == {"Windows PC": 3, "Nintendo 64": 1}
+    calls = {}
+
+    def imported(self, net, path, *, project_parent, project_options, **kwargs):
+        relative = path.relative_to(tmp_path).as_posix()
+        calls[relative] = (project_parent, project_options.get("companions"))
+        if relative == "one.exe":
+            raise RomError("example import failure")
+        return path.stem
+
+    monkeypatch.setattr(consoles.Console, "import_game", imported)
+    monkeypatch.setattr(net, "start_autopilot", lambda slug: None)
+    params = {"path": str(tmp_path), "folder_layout": "separate"}
+    assert client.post("/api/import", params=params, headers=headers).status_code == 400
+    start = client.post("/api/import", params={**params, "confirmed": "1"}, headers=headers)
+    assert start.status_code == 200, start.text
+    for _ in range(100):
+        job = client.get("/api/job", params={"id": start.json()["job"]}).json()
+        if job["state"] != "running":
+            break
+        time.sleep(0.02)
+    assert job["state"] == "done", job
+    assert set(job["result"]["projects"]) == {"two", "library", "game"}
+    assert job["result"]["failures"] == ["one.exe"]
+    assert "example import failure" in "\n".join(job["log"])
+    pc, _ = calls["nested/two.exe"]
+    n64, _ = calls["nested/game.z64"]
+    assert pc.parent == n64.parent and (pc.name, n64.name) == ("pc", "n64")
+
+
 def test_the_home_page_waits_for_no_agent_and_no_projects_files(tmp_path, monkeypatch):
     """The first /api/state ran every agent's --version and `agy models` (3.7 s before the home page showed), and the
     project list built every project's whole overview every 5 s, a fork's files included (2.5-3.7 s with agents at

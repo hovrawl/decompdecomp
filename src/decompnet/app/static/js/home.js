@@ -106,7 +106,7 @@ drop.addEventListener("dragleave", () => drop.classList.remove("over"));
 drop.addEventListener("drop", (e) => {
   e.preventDefault(); drop.classList.remove("over");
   // a folder doesn't come through the browser: the path dialog reads it where it is (a PC game's .exe and its DLLs)
-  if (e.dataTransfer.items?.[0]?.webkitGetAsEntry?.()?.isDirectory) return askPath("That's a folder: give its path here, and decompdecomp reads the game from it where it is.");
+  if (e.dataTransfer.items?.[0]?.webkitGetAsEntry?.()?.isDirectory) return askPath("Choose the folder by path so decompdecomp can scan its files.");
   pickFiles(e.dataTransfer.files);
 });
 $("file").addEventListener("change", () => pickFiles($("file").files));
@@ -412,7 +412,7 @@ async function pickFile(file, extras = []) {
     ? `<b>★ Recommended platform.</b> The most tested path to a full decomp you can port and mod. ${TRY_AND_TELL}`
     : `<b>Beta.</b> ${esc(platformName(p) || "This platform")} works, and needs more games tried on it. ${TRY_AND_TELL}`;
   if (consoleOf(p)?.games_in_folders && !/\.dll$/i.test(file.name)) {  // a dropped .exe comes alone
-    $("romStatus").insertAdjacentHTML("beforeend", ` A dropped file comes alone: for the game's own DLLs too, <button class="link-btn" type="button" id="romByPath">use its path</button> (its folder, or the .exe) instead.`);
+    $("romStatus").insertAdjacentHTML("beforeend", ` A dropped file comes alone: for the game's own DLLs too, <button class="link-btn" type="button" id="romByPath">use the .exe path</button> instead.`);
     $("romByPath").onclick = (e) => { e.stopPropagation(); resetDrop(); askPath(); };
   }
   setupCompilers(info);
@@ -521,6 +521,11 @@ async function runImport(query, file, title, name = "") {
     });
     loadNav();
     location.hash = `#/p/${res.slug}`;
+    if (res.projects) {
+      const failures = res.failures.length;
+      toast(`Opened ${res.projects.length} project(s).${failures ? ` ${failures} import(s) failed: ${esc(res.failures.join(", "))}.` : ""}`,
+        failures ? "err" : "");
+    }
   } catch (e) {
     importFailed(name || title.replace(/^\w+ |…$/g, ""), e, $("jobLog").textContent);
   } finally { clearInterval(tick); $("busyTime").textContent = ""; $("impWork").hidden = true; }
@@ -585,20 +590,61 @@ $("pathPick").onclick = (e) => { e.stopPropagation(); askPath(); };
 function askPath(why = "") {
   // the game isn't known yet: the scope question shows when any platform's import recognises library code
   const asks = (S.st?.consoles || []).some((c) => c.sets_aside);
-  const body = dialog("Use a file or folder on this computer", `${why ? `<p>${esc(why)}</p>` : ""}<p class="muted">For big disc images, and for a Windows game with DLLs of its own: decompdecomp reads the game where it is instead of copying it through the browser. A Windows game's folder, or its .exe, brings the game's own DLLs along (the import says which it found, and which it left out). Choose a .dll file to import it on its own.</p>
-    <label class="field"><span>Path to the game file, or a Windows game's folder</span><span class="pick-row"><input id="ppPath" class="mono" placeholder="/home/me/games/my-game.iso"><button class="ghost small-btn" type="button" data-pick="file" data-for="ppPath" data-title="Your copy of the game">File…</button><button class="ghost small-btn" type="button" data-pick="folder" data-for="ppPath" data-title="The game's folder">Folder…</button></span></label>
+  const body = dialog("Use a file or folder on this computer", `${why ? `<p>${esc(why)}</p>` : ""}<p class="muted">Choose a file to import it, or a folder to find supported targets in its subfolders too. Choose a game's .exe directly to bring along only its recognised companion DLLs.</p>
+    <label class="field"><span>Path to a file or folder</span><span class="pick-row"><input id="ppPath" class="mono" placeholder="/home/me/games/my-game.iso"><button class="ghost small-btn" type="button" data-pick="file" data-for="ppPath" data-title="Your copy of the game">File…</button><button class="ghost small-btn" type="button" data-pick="folder" data-for="ppPath" data-title="Folder of targets">Folder…</button></span></label>
     ${asks ? `<label class="field"><span>What should this project cover? (where decompdecomp recognises library code)</span><select id="ppScope">
       <option value="game" selected>The game's own code: library and middleware code it recognises is left out of agents' work and progress</option>
       <option value="program">The whole program: every function is decompiled and counted</option></select></label>` : ""}
     <label class="check"><input type="checkbox" id="ppOwn"><span>This is my own copy of this game, obtained legally. The results stay with me for my own use.</span></label>
-    <div class="row"><button class="primary" id="ppGo" type="button" disabled>Start decompiling</button><button class="ghost" data-close type="button">Cancel</button></div>`);
-  body.querySelector("#ppOwn").onchange = () => { $("ppGo").disabled = !$("ppOwn").checked; };
-  body.querySelector("#ppGo").onclick = () => {
-    const path = $("ppPath").value.trim();
+    <p id="ppFound" class="muted" role="status" hidden></p>
+    <label class="field" id="ppLayoutField" hidden><span>Windows PC project layout</span><select id="ppLayout">
+      <option value="combined">Combine compatible EXEs and DLLs</option>
+      <option value="separate">Separate project folder per EXE</option>
+    </select></label>
+    <pre id="ppScanLog" hidden></pre>
+    <div class="row"><button class="primary" id="ppGo" type="button" disabled>Continue</button><button class="ghost" data-close type="button">Cancel</button></div>`);
+  const input = $("ppPath"), own = $("ppOwn"), go = $("ppGo"), found = $("ppFound"), layoutField = $("ppLayoutField");
+  let scanned = "";
+  const reset = () => {
+    scanned = "";
+    found.hidden = layoutField.hidden = true;
+    go.textContent = "Continue";
+    go.disabled = !own.checked;
+  };
+  input.oninput = reset;
+  own.onchange = () => { go.disabled = !own.checked; };
+  go.onclick = async () => {
+    const path = input.value.trim();
     if (!path) return;
     const scope = asks ? $("ppScope").value : "";
+    let layout = "";
+    if (path === scanned) {
+      layout = `&folder_layout=${layoutField.hidden ? "combined" : $("ppLayout").value}`;
+    } else {
+      const output = $("ppScanLog");
+      const finish = beginWork(output, "Checking path", [go, own, input, ...body.querySelectorAll("[data-pick]")]);
+      try {
+        const preview = await api("/api/import/folder", { method: "POST", body: { path } });
+        if (!go.isConnected) return;
+        if (preview.folder) {
+          scanned = path;
+          found.textContent = preview.groups.map(({ platform, count }) => `${platform}: ${count}`).join(" · ");
+          found.hidden = false;
+          layoutField.hidden = !preview.layout_choice;
+          go.textContent = "Import folder";
+          return;
+        }
+      } catch (e) {
+        if (go.isConnected) toast(esc(e.message), "err");
+        return;
+      } finally {
+        finish();
+        output._workStatus.hidden = true;
+      }
+    }
     closeDialog();
-    runImport(`confirmed=1&path=${encodeURIComponent(path)}${scope ? `&scope=${scope}` : ""}`, undefined, "Analysing your game…");
+    runImport(`confirmed=1&path=${encodeURIComponent(path)}${scope ? `&scope=${scope}` : ""}${layout}`, undefined,
+      layout ? "Importing folder…" : "Analysing your game…");
   };
 }
 $("demoBtn").onclick = () => runImport("demo=1", undefined, "Opening Demo Quest 64…");

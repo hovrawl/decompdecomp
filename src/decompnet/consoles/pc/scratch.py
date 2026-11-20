@@ -737,18 +737,17 @@ def exports(pe: PE) -> dict[int, str]:
 
 
 def program_in(folder: Path) -> Path | None:
-    """The game's program in a folder the user pointed at: the biggest x86 or x64 .exe in it decompdecomp can start
-    (a launcher, a tool or an uninstaller is smaller than the game), else the biggest it can't (whose import then says
-    why); None: no Windows program in it."""
+    """Prefer the largest supported EXE, or a DLL if the folder contains no EXEs."""
     found = []
     for path in sorted(folder.glob("*")):
-        if path.suffix.lower() == ".exe" and path.is_file():
+        if path.suffix.lower() in (".exe", ".dll") and path.is_file():
             with open(path, "rb") as f:
                 head = f.read(PE_PROBE_BYTES)
             if is_windows_program(head):
                 data = path.read_bytes()
-                found.append((not is_pe(head) or bool(describe(data).blockers()), -len(data), path))
-    return min(found)[2] if found else None
+                found.append((path.suffix.lower() != ".exe", not is_pe(head) or bool(describe(data).blockers()),
+                              -len(data), path))
+    return min(found)[-1] if found else None
 
 
 def _others(path: Path) -> str | None:
@@ -761,6 +760,85 @@ def _others(path: Path) -> str | None:
 
 def _overlaps(start: int, size: int, taken: list[tuple[int, int]]) -> tuple[int, int] | None:
     return next(((a, b) for a, b in taken if start < b and a < start + size), None)
+
+
+def _can_rebase(pe: PE) -> bool:
+    flags = struct.unpack_from("<H", pe.data, _pe_header(pe.data) + 4 + CHARACTERISTICS_AT)[0]
+    return not flags & RELOCS_STRIPPED and all(pe.directory(BASE_RELOCATIONS))
+
+
+def _project_base(pe: PE, taken: list[tuple[int, int]]) -> int | None:
+    base = pe.image_base
+    while (hit := _overlaps(base, pe.image_size, taken)) is not None:
+        base = -(-hit[1] // DLL_GRANULARITY) * DLL_GRANULARITY
+    if base == pe.image_base or (_can_rebase(pe) and base + pe.image_size <= (1 << (64 if pe.x64 else 32))):
+        return base
+    return None
+
+
+def folder_projects(folder: Path, files: list[Path], separate: bool, log) -> list[tuple[Path, dict]]:
+    """PC projects share an architecture and address space. Split targets that cannot safely share one."""
+    exes = [p for p in files if p.suffix.lower() == ".exe"]
+    batches: dict[Path | None, list[Path]] = {}
+    for path in [*exes, *(p for p in files if p not in exes)]:
+        owner = None
+        if separate and exes:
+            owner = next((exe for directory in (path.parent, *path.parent.parents)
+                          for exe in exes if exe.parent == directory), None) if path not in exes else path
+        batches.setdefault(owner, []).append(path)
+    projects = []
+    for batch in batches.values():
+        groups: list[tuple[bool, list[tuple[int, int]], list[Path]]] = []
+        for path in batch:
+            getattr(log, "check_cancel", lambda: None)()
+            try:
+                data = path.read_bytes()
+                if blockers := describe(data).blockers():
+                    log(f"Skipped {path.relative_to(folder)}: {'; '.join(blockers)}")
+                    continue
+                pe = read_pe(data)
+            except (OSError, ForkError, struct.error) as e:
+                log(f"Skipped {path.relative_to(folder)}: {e}")
+                continue
+            for x64, taken, members in groups:
+                if x64 == pe.x64 and (base := _project_base(pe, taken)) is not None:
+                    members.append(path)
+                    taken.append((base, base + pe.image_size))
+                    break
+            else:
+                if groups:
+                    log(f"{path.relative_to(folder)} needs its own project: different architecture or overlapping "
+                        "fixed image address")
+                groups.append((pe.x64, [(pe.image_base, pe.image_base + pe.image_size)], [path]))
+        projects.extend((members[0], {"source_folder": folder, "companions": tuple(members[1:])})
+                        for _, _, members in groups)
+    return projects
+
+
+def folder_modules(folder: Path, paths: tuple[Path, ...], main: PE) -> list[Module]:
+    """Use exactly the batch's targets, without EXE companion-discovery heuristics."""
+    taken = [(main.image_base, main.image_base + main.image_size)]
+    modules: list[Module] = []
+    names: set[str] = set()
+    for path in paths:
+        rel = path.relative_to(folder).as_posix()
+        data = path.read_bytes()
+        built = describe(data)
+        if blockers := built.blockers():
+            raise ForkError(f"Can't import {rel}: {'; '.join(blockers)}")
+        pe = read_pe(data)
+        preferred = pe.image_base
+        if pe.x64 != main.x64 or (base := _project_base(pe, taken)) is None:
+            raise ForkError(f"{rel} no longer fits this project; scan the folder again.")
+        if base != preferred:
+            pe = read_pe(rebase(data, base))
+        taken.append((base, base + pe.image_size))
+        name = re.sub(r"[^a-z0-9_]+", "_", path.stem.lower()).strip("_") or "program"
+        while name in names:
+            name += "_"
+        names.add(name)
+        modules.append(Module(path, rel, name, pe, built, preferred))
+    return modules
 
 
 def find_modules(game: Path, main: PE) -> tuple[list[Module], list[tuple[str, str]]]:
@@ -802,15 +880,11 @@ def find_modules(game: Path, main: PE) -> tuple[list[Module], list[tuple[str, st
                 pe.timestamp - main.timestamp > MODULE_YEAR:
             left_out.append((rel.as_posix(), LATER))
             continue
-        base, preferred = pe.image_base, pe.image_base
-        while (hit := _overlaps(base, pe.image_size, taken)) is not None:
-            base = -(-hit[1] // DLL_GRANULARITY) * DLL_GRANULARITY
+        preferred = pe.image_base
+        if (base := _project_base(pe, taken)) is None:
+            left_out.append((rel.as_posix(), NO_ROOM))
+            continue
         if base != preferred:
-            flags = struct.unpack_from("<H", data, _pe_header(data) + 4 + CHARACTERISTICS_AT)[0]
-            relocations = pe.directory(BASE_RELOCATIONS)
-            if flags & RELOCS_STRIPPED or not relocations[1]:
-                left_out.append((rel.as_posix(), NO_ROOM))
-                continue
             pe = read_pe(rebase(data, base))
         taken.append((base, base + pe.image_size))
         name = re.sub(r"[^a-z0-9_]+", "_", path.stem.lower()).strip("_") or "dll"
@@ -2888,7 +2962,8 @@ def _run(cmd: list[str], root: Path, what: str, log, platform: str = "pc") -> No
 
 def create(root: Path, game: Path, *, compiler: str | None = None, log=print, info: dict | None = None,
            platform: str = "pc", what: str = "your copy of the game's program (.exe)",
-           cl_flags: list[str] | None = None, game_step: str = "", args: list[str] | None = None, plan=None) -> dict:
+           cl_flags: list[str] | None = None, game_step: str = "", args: list[str] | None = None, plan=None,
+           source_folder: Path | None = None, companions: tuple[Path, ...] = ()) -> dict:
     """Make the project in `root` (which must not exist yet) and build it once. Returns facts about the game. Another
     console whose games are x86 programs in another format gives the program as a PE (`game`) and says what it is
     (`info`, as game_info's; `platform`, `what`), its compiler flags (`cl_flags`), how the README's reader gets the
@@ -2930,10 +3005,14 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
     args = args or tool_args()
     ensure_ghidra(log)
     pe = read_pe(game.read_bytes())
-    standalone_dll = platform == "pc" and game.suffix.lower() == ".dll"
-    modules, left_out = ([], []) if standalone_dll else find_modules(game, pe)
+    main_is_dll = platform == "pc" and game.suffix.lower() == ".dll"
+    if source_folder is not None:
+        modules, left_out = folder_modules(source_folder, companions, pe), []
+    else:
+        modules, left_out = ([], []) if main_is_dll else find_modules(game, pe)
     if modules or left_out:
-        log(f"the game's own DLLs beside {game.name}: {', '.join(m.rel for m in modules) or 'none'}")
+        label = "additional folder targets with" if source_folder is not None else "the game's own DLLs beside"
+        log(f"{label} {game.name}: {', '.join(m.rel for m in modules) or 'none'}")
     for line in left_out_lines(left_out):
         log(line)
     log(f"analysing {game.name} with Ghidra (finds every function; a big game takes a few minutes)")
@@ -2953,7 +3032,7 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
     debugs = [debug.info] if debug is not None else []
     real = debug_names(debug.info, [f for fns in groups.values() for f in fns]) if debug is not None else {}
     taken = {re.sub(r"^[_@]|@\d+$", "", f.name) for fns in groups.values() for f in fns} | set(real.values())
-    if standalone_dll:
+    if main_is_dll or source_folder is not None:
         starts = {f.addr for fns in groups.values() for f in fns}
         for addr, name in sorted(exports(pe).items()):
             key = f"func_{addr:08X}" if addr in starts else f"D_{addr:08X}"
@@ -3006,7 +3085,9 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
 
     shutil.copytree(TEMPLATE, root)
     (root / "orig").mkdir()
-    game_path = f"orig/{version}.{'dll' if standalone_dll else 'exe'}"
+    rel = game.relative_to(source_folder).as_posix() if source_folder is not None else \
+        f"{version}.{'dll' if main_is_dll else 'exe'}"
+    game_path = f"orig/{rel}"
     for source, dest in ((game, root / game_path), *((m.path, root / "orig" / m.rel) for m in modules)):
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -3079,7 +3160,7 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
         "created": "from scratch", "platform": platform, "version": version, "compiler": f"MSVC/{compiler}",
         "analysis": WindowsPC.ANALYSIS,  # (all of it: nothing to repair, stubs set aside, pieces joined, thunks named...)
         "tools": tools_version(),
-        "game": {"what": "your copy of the DLL" if standalone_dll else what, "path": game_path, "sha1": info["sha1"]},
+        "game": {"what": "your copy of the DLL" if main_is_dll else what, "path": game_path, "sha1": info["sha1"]},
         "setup": [["python", "tools/configure.py", version, *args], ["ninja", "prepare"]],
         "rebuild": rebuild, **plan.get("manifest", {}),
     }, indent=2), encoding="utf-8")
@@ -3095,7 +3176,7 @@ copy of its program and compared with what `src/` compiles to, function by funct
    Visual C++ 2017 on Linux or macOS runs it through wine: set `DECOMPNET_WINE` (or have wine on the PATH) and
    `DECOMPNET_WINE_PREFIX` (a wine prefix of its own) first.
 3. Decompiled code goes in `src/`; `objdiff.json` shows each function's progress in [objdiff](https://github.com/encounter/objdiff).
-4. `ninja rebuild` puts the whole program back together in `build/{version}/{Path(game_path).name}`, each function from its C
+4. `ninja rebuild` puts the whole program back together in `build/{version}/{rel}`, each function from its C
    where that compiles to the game's code (else from your copy's), and says whether it's your copy, byte for byte.
 
 Compiler: Visual C++ {compiler} (change `MSVC_VERSION` and `CL_FLAGS` in tools/configure.py if the game was built
@@ -3103,7 +3184,7 @@ with another version or other flags; `config/{version}/file_compilers.json` name
 version). `config/{version}/functions.json` holds what the analysis found: every function's address, size, symbol
 and relocations, by source file.
 """ + (f"""
-The game's own DLLs are programs of this project too, each with its source files in `src/auto/<its name>/`:
+Additional programs in this project each have source files in `src/auto/<its name>/`:
 {chr(10).join(f"- `orig/{m.rel}` ({m.name}, at 0x{m.pe.image_base:08X})" for m in modules)}
 
 Put your copies of them there too. A DLL at another address than its own (the program or a DLL before it has that

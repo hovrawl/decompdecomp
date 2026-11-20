@@ -3171,8 +3171,8 @@ def test_a_forwarded_export_is_another_dlls_code():
     assert scratch_pe.exports(scratch_pe.read_pe(dll)) == {0x10001000: "Init"}
 
 
-@pytest.mark.parametrize("target", ["x86", "x64"])
-def test_a_standalone_dll_is_imported_once_and_keeps_its_extension(tmp_path, monkeypatch, target):
+@pytest.mark.parametrize(("target", "batch"), [("x86", False), ("x64", False), ("x86", True)])
+def test_dll_projects_keep_original_extensions_and_rebuild(tmp_path, monkeypatch, target, batch):
     top = _game_folder(tmp_path)
     dll = top / "engine.dll"
     if target == "x64":
@@ -3190,6 +3190,7 @@ def test_a_standalone_dll_is_imported_once_and_keeps_its_extension(tmp_path, mon
     rows = ([_row(0x10001000, 0x10001006), _row(0x10001010, 0x10001016)] if target == "x86" else
             [_row(X64_BASE + 0x1070, X64_BASE + 0x1088)])
     monkeypatch.setattr(ghidra, "functions", lambda path: rows)
+
     def prepare(cmd, root, *args, **kwargs):
         if cmd[:2] == ["ninja", "prepare"]:
             subprocess.run([sys.executable, "tools/delink.py", "config/engine/functions.json",
@@ -3202,17 +3203,20 @@ def test_a_standalone_dll_is_imported_once_and_keeps_its_extension(tmp_path, mon
     info = {"id": "engine", "title": "engine", "compiler": version, "target": target,
             "sha1": hashlib.sha1(dll.read_bytes()).hexdigest(), "summary": "test", "cannot_match": [],
             "compiler_why": "test", "exact": True}
-    scratch_pe.create(root, dll, info=info, args=["--test"], log=lambda *_: None)
+    options = {"source_folder": top, "companions": (top / "data" / "logic.dll",)} if batch else {}
+    scratch_pe.create(root, dll, info=info, args=["--test"], log=lambda *_: None, **options)
     manifest = json.loads((root / ".decomp.wtf.json").read_text())
     config = json.loads((root / "config/engine/functions.json").read_text())
     assert manifest["game"]["path"] == config["exe"] == "orig/engine.dll"
     assert (root / config["exe"]).read_bytes() == dll.read_bytes()
-    assert not config.get("modules")
+    assert [m["exe"] for m in config.get("modules", [])] == (["orig/data/logic.dll"] if batch else [])
     if target == "x86":
         assert config["names"]["func_10001000"] == "Engine_Init"
     assert "orig/engine.dll" in (root / "README.md").read_text()
     assert manifest["rebuild"]["identical"]
     assert (root / "build/engine/engine.dll").read_bytes() == dll.read_bytes()
+    if batch:
+        assert (root / "build/engine/data/logic.dll").read_bytes() == options["companions"][0].read_bytes()
 
 
 def test_a_folder_imports_its_biggest_program_decompdecomp_can_start(tmp_path):
@@ -3223,8 +3227,7 @@ def test_a_folder_imports_its_biggest_program_decompdecomp_can_start(tmp_path):
     (top / "setup.exe").write_bytes(_tiny_program(bytes.fromhex("c3"), 0x400000, dll=False)[:0x400])
     (top / "tool_arm64.exe").write_bytes(_windows_program(machine=0xAA64) + bytes(0x10000))
     assert consoles.game_in(top) == top / "game.exe"
-    with pytest.raises(Exception, match="holds no game file"):
-        consoles.game_in(top / "data")
+    assert consoles.game_in(top / "data") == top / "data/logic.dll"
     assert consoles.get("pc").describe()["games_in_folders"] and not consoles.get("n64").describe()["games_in_folders"]
 
 
@@ -3238,6 +3241,27 @@ def test_importing_a_folder_starts_from_its_program(tmp_path, monkeypatch):
     net = RomNetwork(tmp_path / "app.db", tmp_path / "work")
     assert net.import_rom(top, confirmed=True, log=said.append) == "s"
     assert started == [top / "game.exe"] and said == ["the game's program in that folder: game.exe"]
+
+
+def test_folder_batch_layout_handles_multiple_exes_and_nested_dlls(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    exe, other, dll = a / "a.exe", b / "b.exe", b / "engine.dll"
+    for path in (exe, other):
+        path.write_bytes(_tiny_program(b"\xc3", 0x10000000, dll=False, relocs=DLL_RELOCS))
+    dll.write_bytes(_tiny_program(DLL_CODE, 0x10000000, relocs=DLL_RELOCS))
+    pc = consoles.get("pc")
+    files = [exe, other, dll]
+    assert pc.folder_has_layout_choice(files)
+
+    def layout(files, separate):
+        return [(p, opts["companions"]) for p, opts in pc.folder_projects(tmp_path, files, separate, print)]
+
+    assert layout(files, False) == [(exe, (other, dll))]
+    assert layout(files, True) == [(exe, ()), (other, (dll,))]
+    other.write_bytes(_tiny_program(b"\xc3", 0x10000000, dll=False, stripped=True))
+    assert layout(files, False) == [(exe, (dll,)), (other, ())]
 
 
 def _project_with_dlls(tmp_path: Path) -> Path:
