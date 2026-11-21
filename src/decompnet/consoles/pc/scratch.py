@@ -39,6 +39,7 @@ import functools
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import shutil
 import struct
@@ -2944,12 +2945,58 @@ def ensure_ghidra(log) -> None:
         toolchains.ensure("ghidra", log=log)
 
 
-def module_rows(ghidra, module: Path, moved: int) -> list[dict]:
+ANALYSIS_KEEP = "analysis"  # under the app's .decomp folder: one JSON file per analysed program
+
+
+def _analysis_file(program: Path) -> Path | None:
+    """Where Ghidra's rows of this exact program are kept: named by the program's bytes and the analysis script, so a
+    retry, a resumed folder import or a second project of the same DLL reads them instead of running Ghidra again
+    (a big DLL takes close to an hour). None when the program can't be read."""
+    from ...app import edition
+
+    try:
+        digest = hashlib.sha256(program.read_bytes())
+    except OSError:
+        return None
+    script = Path(__file__).parents[2] / "forks" / "ghidra_scripts" / "DecompWtfFunctions.java"
+    try:
+        digest.update(script.read_bytes())
+    except OSError:
+        pass
+    return edition.home_dir() / ".decomp" / ANALYSIS_KEEP / f"{digest.hexdigest()[:32]}.json"
+
+
+def analyse_program(ghidra, program: Path, log=print, label: str = "") -> list[dict]:
+    """ghidra.functions(program), kept on disk as soon as Ghidra is done and read from there next time (import_folder
+    analyses about twenty DLLs one after another, and a failure or cancel at the last one used to lose all of it).
+    A damaged file is analysed again."""
+    keep = _analysis_file(program)
+    if keep is not None and keep.is_file():
+        try:
+            rows = json.loads(keep.read_text(encoding="utf-8"))
+            if isinstance(rows, list):
+                log(f"{label or program.name}: Ghidra's analysis from an earlier import is used ({len(rows)} functions)")
+                return rows
+        except (OSError, ValueError):
+            pass
+    rows = ghidra.functions(program)
+    if keep is not None and rows:
+        try:
+            keep.parent.mkdir(parents=True, exist_ok=True)
+            tmp = keep.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(rows), encoding="utf-8")
+            os.replace(tmp, keep)
+        except OSError as e:
+            log(f"Ghidra's analysis of {program.name} couldn't be kept for a retry: {e}")
+    return rows
+
+
+def module_rows(ghidra, module: Path, moved: int, log=print) -> list[dict]:
     """Ghidra's functions of one of the game's DLLs, at the address the project gives it (`moved` from the one its
     header prefers, where Ghidra reads it). Its own names (its exports, its debug information) go to "names"
     instead, as several DLLs export the same names (an engine's and a game's DLL both export their interface)."""
     return [{**r, "entry": r["entry"] + moved, **({"end": r["end"] + moved} if "end" in r else {}),
-             "source": "DEFAULT"} for r in ghidra.functions(module)]
+             "source": "DEFAULT"} for r in analyse_program(ghidra, module, log)]
 
 
 def _run(cmd: list[str], root: Path, what: str, log, platform: str = "pc") -> None:
@@ -3015,8 +3062,9 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
         log(f"{label} {game.name}: {', '.join(m.rel for m in modules) or 'none'}")
     for line in left_out_lines(left_out):
         log(line)
-    log(f"analysing {game.name} with Ghidra (finds every function; a big game takes a few minutes)")
-    found = ghidra.functions(game)
+    total = 1 + len(modules)
+    log(f"[1 of {total}] analysing {game.name} with Ghidra (finds every function; a big game takes a few minutes)")
+    found = analyse_program(ghidra, game, log, game.name)
     if not found:
         why = (info["cannot_match"] or ["a program that is packed or protected in a way decompdecomp doesn't recognise "
                                         "shows none: decompdecomp never unpacks or gets around protection"])[0]
@@ -3040,14 +3088,14 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
                 real[key] = name
                 taken.add(name)
     symbols = {f.name for fns in groups.values() for f in fns}
-    for m in modules:
+    for number, m in enumerate(modules, 2):
         pes[m.name] = m.pe
         moved = m.pe.image_base - m.preferred
         where = (f"at 0x{m.pe.image_base:08X}, its own address" if not moved else
                  f"at 0x{m.pe.image_base:08X}: the program or a DLL before it has its own address, 0x{m.preferred:08X}, "
                  "so it's moved by its base relocations, as Windows moves it")
-        log(f"analysing {m.rel} with Ghidra: {m.built.summary()}, {where}")
-        rows = module_rows(ghidra, m.path, moved)
+        log(f"[{number} of {total}] analysing {m.rel} with Ghidra: {m.built.summary()}, {where}")
+        rows = module_rows(ghidra, m.path, moved, log)
         found_debug = debuginfo.find(m.path, m.pe.data, HEADER_NAMES, log=log)  # (read at its address in the project)
         if found_debug is not None:
             log(f"{m.rel}: {found_debug.source}: {found_debug.info.summary()}")

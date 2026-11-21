@@ -4030,3 +4030,45 @@ def test_a_64_bit_game_reaches_the_users_own_x64_copy(tmp_path, monkeypatch):
     # can (installed is True because built.own is found). Before the fix, a 64-bit game got own=None here too.
     rows = scratch_pe.program_compilers(data)
     assert rows and all(installed for *_, installed in rows)
+
+
+def test_ghidras_analysis_of_a_program_is_kept_and_read_on_the_next_import(tmp_path, monkeypatch):
+    """A folder import analysed ~20 DLLs one after another and kept nothing until the last: each program's rows are
+    saved when Ghidra finishes, and a retry (or a resume) reads them."""
+    from decompnet.consoles.pc import scratch
+
+    monkeypatch.setenv("DECOMP_HOME", str(tmp_path / "home"))
+    dll = tmp_path / "a.dll"
+    dll.write_bytes(_tiny_program(b"\xc3", 0x400000, dll=True))
+    runs, said = [], []
+
+    class FakeGhidra:
+        @staticmethod
+        def functions(program):
+            runs.append(program)
+            return [{"entry": 0x401000, "end": 0x401001, "name": "f"}]
+
+    first = scratch.analyse_program(FakeGhidra, dll, said.append)
+    again = scratch.analyse_program(FakeGhidra, dll, said.append)
+    assert first == again and len(runs) == 1 and "earlier import" in said[-1]
+    keep = scratch._analysis_file(dll)
+    keep.write_text("not json")  # a damaged file is analysed again
+    assert scratch.analyse_program(FakeGhidra, dll, said.append) == first and len(runs) == 2
+    dll.write_bytes(_tiny_program(b"\xc3\xc3", 0x400000, dll=True))  # another program: its own analysis
+    scratch.analyse_program(FakeGhidra, dll, said.append)
+    assert len(runs) == 3
+    assert not list(keep.parent.glob("*.tmp"))
+
+
+def test_the_background_drafter_skips_a_project_that_is_not_set_up_yet(tmp_path):
+    from decompnet.app.forkengine import ForkEngine
+
+    class Fp:
+        root = tmp_path  # no objdiff.json
+
+        def unit(self, name):
+            raise AssertionError("looked for a unit in a project without its objdiff.json")
+
+    engine = ForkEngine.__new__(ForkEngine)
+    engine.get = lambda slug: (None, Fp(), {})
+    assert engine.background_draft({"slug": "x"}, {"unit": "u"}) is None
