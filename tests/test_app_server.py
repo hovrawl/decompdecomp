@@ -1263,3 +1263,129 @@ def test_compiler_profile_jobs_stream_progress_and_reuse_active_task(app, monkey
         release.set()
     bad = client.post('/api/compiler/test-default', headers={'X-Decomp': '1'}, json={**data, 'action': 'unsupported'})
     assert bad.status_code == 400
+
+
+# ---------------------------------------------------------------- imports are recorded on disk first (app/imports.py)
+
+
+def _two_games(tmp_path):
+    from tests.test_pc import _tiny_program
+
+    for name in ("one.exe", "two.exe"):
+        (tmp_path / name).write_bytes(_tiny_program(b"\xc3", 0x400000))
+    return {"path": str(tmp_path), "folder_layout": "separate", "confirmed": "1"}
+
+
+def _until(client, imp, states, tries=200):
+    for _ in range(tries):
+        j = client.get("/api/import/status", params={"id": imp}).json()
+        if j.get("state") in states:
+            return j
+        time.sleep(0.02)
+    raise AssertionError(j)
+
+
+def test_an_import_exists_on_disk_before_its_work_starts(app, tmp_path, monkeypatch):
+    """The journal is written when the import is asked for: the page follows it at once, and it can be resumed."""
+    from decompnet import consoles
+
+    client, net, _ = app
+    params, headers = _two_games(tmp_path), {"X-Decomp": "1"}
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked(self, net_, path, *, project_parent, **kwargs):
+        entered.set()
+        release.wait(5)
+        return path.stem
+
+    monkeypatch.setattr(consoles.Console, "import_game", blocked)
+    monkeypatch.setattr(net, "start_autopilot", lambda slug: None)
+    start = client.post("/api/import", params=params, headers=headers).json()
+    entered.wait(5)
+    journal = net.workspace / ".decomp" / "imports" / start["import"] / "import.json"
+    saved = json.loads(journal.read_text(encoding="utf-8"))
+    assert saved["state"] == "running" and saved["params"]["layout"] == "separate" and saved["source"] == str(tmp_path)
+    assert saved["parent"] and (net.workspace / saved["parent"]).is_dir() or saved["parent"]
+    assert [d["id"] for d in client.get("/api/imports").json()] == [start["import"]]
+    release.set()
+    assert _until(client, start["import"], {"done"})["projects"] == ["one", "two"]
+    assert client.get("/api/imports").json() == []  # done: the project is the record now
+
+
+def test_a_stopped_folder_import_resumes_with_the_games_not_done(app, tmp_path, monkeypatch):
+    from decompnet import consoles
+
+    client, net, _ = app
+    params, headers = _two_games(tmp_path), {"X-Decomp": "1"}
+    seen = []
+
+    def flaky(self, net_, path, *, project_parent, **kwargs):
+        seen.append(path.name)
+        if path.name == "two.exe" and seen.count("two.exe") == 1:
+            raise RuntimeError("the app went wrong on the second game")
+        with net.store.tx() as db:  # (an imported game has its project row)
+            db.execute("INSERT OR IGNORE INTO projects(slug,name,root,config) VALUES(?,?,?,?)",
+                       (path.stem, path.stem, str(project_parent / path.stem), "{}"))
+        return path.stem
+
+    monkeypatch.setattr(consoles.Console, "import_game", flaky)
+    monkeypatch.setattr(net, "start_autopilot", lambda slug: None)
+    imp = client.post("/api/import", params=params, headers=headers).json()["import"]
+    stopped = _until(client, imp, {"failed"})
+    assert stopped["done"] == {"one.exe": "one"} and "second game" in stopped["error"]
+    assert client.post("/api/import/resume", json={"id": "nope"}, headers=headers).status_code == 404
+    assert client.post("/api/import/resume", json={"id": imp}, headers=headers).status_code == 200
+    done = _until(client, imp, {"done"})
+    assert seen == ["one.exe", "two.exe", "two.exe"]  # the first game was not imported again
+    assert set(done["projects"]) == {"one", "two"}
+    assert client.post("/api/import/resume", json={"id": imp}, headers=headers).status_code == 400
+
+
+def test_cancelling_a_running_import_forgets_it(app, tmp_path, monkeypatch):
+    from decompnet import consoles
+
+    client, net, _ = app
+    params, headers = _two_games(tmp_path), {"X-Decomp": "1"}
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked(self, net_, path, *, log, **kwargs):
+        entered.set()
+        release.wait(5)
+        log("still going")  # a job's log is where it finds out it was cancelled
+        return path.stem
+
+    monkeypatch.setattr(consoles.Console, "import_game", blocked)
+    imp = client.post("/api/import", params=params, headers=headers).json()["import"]
+    entered.wait(5)
+    assert client.post("/api/import/cancel", json={"id": imp}, headers=headers).json() == {"cancelling": True}
+    assert client.get("/api/import/status", params={"id": imp}).json()["state"] == "cancelling"
+    release.set()
+    for _ in range(200):
+        if client.get("/api/import/status", params={"id": imp}).status_code == 404:
+            break
+        time.sleep(0.02)
+    assert client.get("/api/import/status", params={"id": imp}).status_code == 404
+    assert client.get("/api/imports").json() == []
+    from decompnet.app.engine.common import slugify
+
+    assert not any(net.workspace.glob(f"{slugify(tmp_path.name)}-batch*"))  # no project was made: its folder goes too
+
+
+def test_the_import_journal_survives_a_restart_as_interrupted(tmp_path):
+    from decompnet.app.imports import Imports
+
+    store = Imports(tmp_path)
+    upload = tmp_path / "uploads" / "abc12345"
+    upload.mkdir(parents=True)
+    (upload / "game.z64").write_bytes(b"x")
+    j = store.create(title="game.z64", kind="file", source=str(upload / "game.z64"), params={"scope": None}, uploaded=True)
+    store.log(j["id"], "splitting")
+    store.log(j["id"], "again")  # (the second is inside the save interval: kept in memory until the next flush)
+    store.finish(j["id"], "running")
+    assert store.get(j["id"])["log"] == ["splitting", "again"]
+    Imports(tmp_path).interrupt_running()  # the next start of the app
+    assert store.get(j["id"])["state"] == "interrupted"
+    assert [d["id"] for d in store.pending()] == [j["id"]]
+    store.discard(j["id"])
+    assert store.get(j["id"]) is None and not upload.exists()  # (the copy of an upload goes with it)
+    assert store.get("../x") is None

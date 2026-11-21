@@ -86,26 +86,42 @@ def pair_old_functions(rows, functions) -> dict:
 
 
 class ImportMixin:
-    def import_folder(self, folder: Path, *, separate: bool, scope: str | None, log=print) -> dict:
+    def import_folder(self, folder: Path, *, separate: bool, scope: str | None, log=print, parent: Path | None = None,
+                      done: dict[str, str] | None = None, on_parent=None, on_game=None) -> dict:
+        """Import every game in a folder, one project each. Resumable: `parent` is the batch folder a first run made
+        (`on_parent(path)` says where it is, as soon as it exists), `done` maps the games already imported to their
+        slugs (a resume skips them), and `on_game(name, slug)` / `on_game(name, None)` report each game's end, so a
+        journal (app/imports.py) always knows how far it got."""
         groups = folder_targets(folder, log)
-        base = f"{slugify(folder.name)}-batch"
-        parent = self.workspace / base
-        n = 2
-        while True:
-            try:
-                parent.mkdir(parents=True)
-            except FileExistsError:
-                parent = self.workspace / f"{base}-{n}"
-                n += 1
-            else:
-                break
-        projects, failures = [], []
+        if parent is None:
+            base = f"{slugify(folder.name)}-batch"
+            parent = self.workspace / base
+            n = 2
+            while True:
+                try:
+                    parent.mkdir(parents=True)
+                except FileExistsError:
+                    parent = self.workspace / f"{base}-{n}"
+                    n += 1
+                else:
+                    break
+        else:
+            parent.mkdir(parents=True, exist_ok=True)
+        if on_parent:
+            on_parent(parent)
+        done = dict(done or {})
+        projects = [slug for slug in done.values() if self.store.one("SELECT 1 FROM projects WHERE slug=?", slug)]
+        failures = []
         check_cancel = getattr(log, "check_cancel", lambda: None)
         log(f"Found {sum(map(len, groups.values()))} targets. New projects go in {parent}")
+        if done:
+            log(f"Resuming: {len(done)} already imported, they are skipped")
         for console, files in groups.items():
             for primary, options in console.folder_projects(folder, files, separate, log):
                 check_cancel()
                 name = primary.relative_to(folder).as_posix()
+                if name in done:
+                    continue
                 log(f"Importing {name} ({console.name})")
                 try:
                     slug = console.import_game(self, primary, name=primary.name, scope=scope, log=log,
@@ -113,9 +129,14 @@ class ImportMixin:
                 except (RomError, NetworkError) as e:
                     log(f"Could not import {name}: {e}")
                     failures.append(name)
+                    if on_game:
+                        on_game(name, None)
                 else:
                     if slug not in projects:
                         projects.append(slug)
+                    done[name] = slug
+                    if on_game:
+                        on_game(name, slug)
         if not projects:
             raise NetworkError("No projects were imported. See the import log for details.")
         return {"slug": projects[0], "projects": projects, "failures": failures}
@@ -151,8 +172,15 @@ class ImportMixin:
                      project_parent: Path | None = None) -> str:
         """ROM mode: split the program `console` read from the user's file, store every function as a target."""
         if reimport_slug is None:
-            return self._import_split(console, picked, toolchain=toolchain, flags=flags, log=log,
-                                      project_parent=project_parent)
+            created: list[Path] = []
+            try:
+                return self._import_split(console, picked, toolchain=toolchain, flags=flags, log=log,
+                                          project_parent=project_parent, created=created)
+            except BaseException:  # a failed or cancelled split leaves no half-made folder (nor a project row)
+                for folder in created:
+                    if not self.store.one("SELECT 1 FROM projects WHERE root=?", str(folder)):
+                        shutil.rmtree(folder, ignore_errors=True)
+                raise
         with self.progress.rebuilding(reimport_slug):
             return self._reimport_split(console, picked, toolchain=toolchain, flags=flags, log=log,
                                         reimport_slug=reimport_slug)
@@ -177,7 +205,7 @@ class ImportMixin:
 
     def _import_split(self, console: consoles.Console, picked: Picked, *, toolchain: str | None = None,
                       flags: list[str] | None = None, log=print, reimport=None, workdir: Path | None = None,
-                      project_parent: Path | None = None) -> str:
+                      project_parent: Path | None = None, created: list[Path] | None = None) -> str:
         rom, info = picked.data, picked.info
         check_cancel = getattr(log, "check_cancel", lambda: None)
         check_cancel()
@@ -193,6 +221,8 @@ class ImportMixin:
                 slug, n = f"{base}-{n}", n + 1
             workdir = parent / slug
             workdir.mkdir(parents=True)
+            if created is not None:
+                created.append(workdir)
         else:
             slug = reimport["slug"]
             if workdir is None:

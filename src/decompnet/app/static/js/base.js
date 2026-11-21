@@ -260,7 +260,7 @@ const S = {
   projects: [], agents: null,
   gen: 0, primed: false, openedAt: 0,  // which opening of a project polls belong to, its first poll done, and when
 };
-const VIEWS = ["home", "catalog", "project", "agentsPage", "toolsPage", "settingsPage"];
+const VIEWS = ["home", "catalog", "project", "agentsPage", "toolsPage", "settingsPage", "importPage"];
 /* A project's views. Activity is in Agents now, Team and Source are the header's Decompile together and Export:
    seven tabs were too many to tell apart. */
 const TABS = ["overview", "functions", "agents", "settings"];
@@ -323,10 +323,15 @@ function agentsFound() {
 function route() {
   const h = location.hash;
   const m = h.match(/^#\/p\/([\w-]+)(?:\/(\w+))?/);
+  const imp = h.match(/^#\/import\/(\w+)/);
   closeAll();
   closeNav();
   hideLaunch();
-  if (m) {
+  if (!imp) stopImportPage();
+  if (imp) {
+    leaveProject();
+    showImportPage(imp[1]);
+  } else if (m) {
     if (S.slug === m[1] && !$("project").hidden) { setTab(m[2] || "overview"); markNav(); return; }
     leaveProject();
     openProject(m[1], m[2] || "overview");

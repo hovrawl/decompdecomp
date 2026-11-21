@@ -513,23 +513,113 @@ async function runImport(query, file, title, name = "") {
     } else {
       started = await api(`/api/import?${query}`, { method: "POST", raw: file ?? new ArrayBuffer(0) });
     }
-    $("impUp").hidden = true;
-    $("impWork").hidden = false;
-    const res = await followJob(started.job, $("jobLog"), (log) => {
-      const last = log.filter((l) => l.trim()).pop();
-      if (last) $("busyStep").textContent = last.trim().replace(/\s+/g, " ").slice(0, 120);
-    });
+    // The import is recorded on disk now (app/imports.py): follow it on its own page, which survives leaving it,
+    // closing the app, and a failure (resume or cancel from there).
+    resetDrop();
     loadNav();
-    location.hash = `#/p/${res.slug}`;
-    if (res.projects) {
-      const failures = res.failures.length;
-      toast(`Opened ${res.projects.length} project(s).${failures ? ` ${failures} import(s) failed: ${esc(res.failures.join(", "))}.` : ""}`,
-        failures ? "err" : "");
-    }
+    location.hash = `#/import/${started.import}`;
   } catch (e) {
     importFailed(name || title.replace(/^\w+ |…$/g, ""), e, $("jobLog").textContent);
   } finally { clearInterval(tick); $("busyTime").textContent = ""; $("impWork").hidden = true; }
 }
+
+/* ---- An import in progress: its page follows the journal on disk (app/imports.py) and its job's live log. It moves
+   to the project when the import is done; a stopped one can be resumed, and any can be cancelled. */
+const IMPORT_SLOW_MS = 3000;
+let impTimer = null, impId = null, impLast = null;
+function stopImportPage() { clearTimeout(impTimer); impTimer = null; impId = null; }
+
+async function showImportPage(id) {
+  show("importPage");
+  stopImportPage();
+  impId = id;
+  $("impLog").textContent = "";
+  await pollImport(id);
+}
+
+async function pollImport(id) {
+  if (impId !== id) return;
+  let j;
+  try { j = await api(`/api/import/status?id=${encodeURIComponent(id)}`); } catch {
+    if (impId === id) { loadNav(); location.hash = "#/"; }  // gone: cancelled, or finished long ago
+    return;
+  }
+  if (impId !== id) return;
+  const live = j.state === "running" || j.state === "cancelling";
+  let lines = j.log;
+  if (live && j.job) {  // the job has every line (the journal keeps the newest 400, saved once a second)
+    try { lines = (await api(`/api/job?id=${j.job}`)).log; } catch { /* it ended between the two asks */ }
+    if (impId !== id) return;
+  }
+  impLast = { j, lines };
+  renderImportPage(j, lines);
+  if (j.state === "done") {
+    stopImportPage();
+    loadNav();
+    location.hash = `#/p/${j.slug}`;
+    const failures = (j.failures || []).length;
+    if (j.kind === "folder") {
+      toast(`Opened ${j.projects.length} project(s).${failures ? ` ${failures} import(s) failed: ${esc(j.failures.join(", "))}.` : ""}`, failures ? "err" : "");
+    }
+    return;
+  }
+  loadNav();
+  impTimer = setTimeout(() => pollImport(id), live ? JOB_POLL_MS : IMPORT_SLOW_MS);
+}
+
+function renderImportPage(j, lines) {
+  const stopped = j.state === "failed" || j.state === "interrupted";
+  const doneCount = Object.keys(j.done || {}).length;
+  $("impKind").textContent = j.kind === "folder" ? "Importing a folder" : "Importing a game";
+  $("impTitle").textContent = j.title;
+  $("impState").textContent = {
+    running: "Working. Everything needed to resume is saved, so you can leave this page: the import keeps running.",
+    cancelling: "Cancelling…",
+    failed: "Stopped by an error. Resume to try again" + (j.kind === "folder" ? "; games already imported are kept." : "."),
+    interrupted: "decompdecomp closed while this was running. Resume to continue" + (j.kind === "folder" ? " with the games not done yet." : "."),
+  }[j.state] || j.state;
+  $("impPageBar").hidden = stopped || j.state === "done";
+  $("impError").hidden = !(stopped && j.error);
+  $("impError").textContent = j.error || "";
+  $("impFolder").textContent = j.kind === "folder"
+    ? [j.parent && `New projects go in ${j.parent}`, doneCount && `${doneCount} imported`, (j.failures || []).length && `${j.failures.length} failed: ${j.failures.join(", ")}`].filter(Boolean).join(" · ")
+    : j.source ? `From ${j.source}` : "";
+  $("impResume").hidden = !stopped;
+  $("impCancel").textContent = stopped ? "Remove import" : "Cancel import";
+  $("impCancel").disabled = j.state === "cancelling";
+  const log = $("impLog");
+  const text = lines.join("\n");
+  if (log.textContent !== text) {
+    const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+    log.textContent = text;
+    if (atEnd) log.scrollTop = log.scrollHeight;
+  }
+}
+
+$("impResume").onclick = async () => {
+  const id = impId;
+  if (!id) return;
+  $("impResume").disabled = true;
+  try {
+    await api("/api/import/resume", { method: "POST", body: { id } });
+    clearTimeout(impTimer);
+    pollImport(id);
+  } catch (e) { toast(esc(e.message), "err"); } finally { $("impResume").disabled = false; }
+};
+$("impCancel").onclick = async () => {
+  const id = impId;
+  if (!id) return;
+  try {
+    const res = await api("/api/import/cancel", { method: "POST", body: { id } });
+    if (res.cancelling) { clearTimeout(impTimer); pollImport(id); } else { loadNav(); location.hash = "#/"; }
+  } catch (e) { toast(esc(e.message), "err"); }
+};
+$("impCopy").onclick = async () => {
+  if (!impLast) return;
+  const { j, lines } = impLast;
+  if (await copyText(bugReport([`Importing: ${j.title}`, `State: ${j.state}`, j.error && `Error: ${j.error}`].filter(Boolean), lines.join("\n")))) toast("Copied: paste it into a GitHub issue");
+  else toast("Couldn't reach the clipboard: select the text under Diagnostics instead", "err");
+};
 
 /* A failed import stays on screen with what happened, ready to report: a toast is gone before it's read. */
 function importFailed(name, e, logText) {

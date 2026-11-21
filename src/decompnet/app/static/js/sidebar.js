@@ -7,6 +7,7 @@ function markNav() {
   const h = location.hash || "#/";
   const route = h.startsWith("#/p/") ? "project" : (h.replace("#/", "") || "home");
   document.querySelectorAll(".nav [data-route]").forEach((a) => a.classList.toggle("on", a.dataset.route === route));
+  document.querySelectorAll(".nav-import").forEach((a) => a.classList.toggle("on", a.getAttribute("href") === h));
   document.querySelectorAll(".nav-proj").forEach((a) => a.classList.toggle("on", a.dataset.slug === S.slug && route === "project"));
 }
 /* One ask at a time: when the list took longer than 5 s (11 s with two projects whose game file was gone), the
@@ -20,8 +21,15 @@ async function loadNav(timer = false) {
     /* With hundreds of games the list is long: `since` gets just "the same" when nothing changed (routes/state.py),
        and nothing is redrawn. A rename or a new project asks without it (timer=false). */
     const got = await api(timer && navSig ? `/api/projects?since=${navSig}` : "/api/projects?since=");
+    // imports not finished (running, failed, or stopped by closing the app) are listed first (app/imports.py)
+    let importsChanged = false;
+    try {
+      const imports = await api("/api/imports");
+      importsChanged = JSON.stringify(imports) !== JSON.stringify(S.imports || []);
+      S.imports = imports;
+    } catch { /* an older server has none */ }
     if (Array.isArray(got)) { S.projects = got; navSig = ""; }  // (an older server: the list itself)
-    else if (got.same) return;
+    else if (got.same) { if (!importsChanged) return; }
     else { S.projects = got.projects; navSig = got.sig; }
   } catch (e) {
     if (!S.projects?.length) $("navProjects").innerHTML = `<p class="nav-empty">Couldn't load your projects: ${esc(e.message)}</p>`;
@@ -54,10 +62,18 @@ function renderNav() {
   if (filter) filter.hidden = S.projects.length < NAV_FILTER_FROM;
   const wanted = S.projects.length < NAV_FILTER_FROM || !navFilter ? S.projects
     : S.projects.filter((p) => `${p.title} ${p.platform_short || ""} ${p.platform_name || ""}`.toLowerCase().includes(navFilter));
+  const importing = (S.imports || []).map((d) => {
+    const stopped = d.state === "failed" || d.state === "interrupted";
+    const words = stopped ? (d.state === "failed" ? "stopped: resume or cancel" : "paused: resume or cancel") : d.state === "cancelling" ? "cancelling…" : "importing…";
+    const doneOf = d.kind === "folder" && Object.keys(d.done || {}).length ? ` · ${Object.keys(d.done).length} done` : "";
+    return `<a class="nav-proj nav-import ${stopped ? "broken" : ""}" href="#/import/${esc(d.id)}" title="${esc(d.error || d.title)}">
+      <span class="np-top"><span class="np-name">${esc(d.title)}</span>${stopped ? "" : `<span class="dot work" title="importing"></span>`}</span>
+      <span class="np-meta"><span>${words}${doneOf}</span></span></a>`;
+  }).join("");
   let html;
-  if (!S.projects.length) html = `<p class="nav-empty">None yet: drop in a game.</p>`;
-  else if (!wanted.length) html = `<p class="nav-empty">No project matches.</p>`;
-  else html = wanted.map((p) => {
+  if (!S.projects.length && !importing) html = `<p class="nav-empty">None yet: drop in a game.</p>`;
+  else if (!wanted.length && !importing) html = `<p class="nav-empty">No project matches.</p>`;
+  else html = importing + wanted.map((p) => {
     const pct = codePct(p);
     const short = p.platform_short || p.platform_name || "?";
     const state = p.working ? `<span class="dot on" title="${p.working} agent${p.working === 1 ? "" : "s"} working"></span>`
