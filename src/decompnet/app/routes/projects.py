@@ -6,7 +6,6 @@ Each is fn(slug, request, data) wrapped by with_project, which checks the reques
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 from starlette.requests import Request
@@ -15,7 +14,7 @@ from starlette.responses import JSONResponse, Response
 from ... import consoles, hostenv, toolchains
 from ...forks.project import SCOPES
 from ...network import NetworkError
-from .. import deep_permuter, saves
+from .. import deep_permuter, saves, storage
 from ..engine import parse_ranges
 from . import App
 
@@ -201,12 +200,14 @@ def register(app: App) -> None:
         net.remove_project(slug)
         if app.invalidate_map:
             app.invalidate_map(slug)
-        if data.get("files"):
-            shutil.rmtree(proj["root"], ignore_errors=True)
+        left: list[str] = []
+        if data.get("files"):  # what can't be deleted (a file another program holds open) is said, not hidden
+            left = storage.remove_tree(Path(proj["root"])) if Path(proj["root"]).exists() else []
+            storage.prune_empty(Path(proj["root"]), Path(net.workspace))
         if settings.data.get("last_project") == slug:
             settings.data["last_project"] = None
             settings.save()
-        return {"ok": True}
+        return {"ok": True, "folder": proj["root"], "deleted_files": bool(data.get("files")), "left": left[:20]}
 
     def p_try(slug, request, data):
         """You, editing a function in the GUI: judged like an agent's attempt (and credited to "you")."""

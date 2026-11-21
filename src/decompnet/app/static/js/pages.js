@@ -260,7 +260,9 @@ async function showSettingsPage() {
   const theme = savedTheme();
   $("setComputer").innerHTML = `
     <div class="field"><span>Appearance</span><div class="seg" id="themeSeg">${THEMES.map(([k, l]) => `<button type="button" data-theme="${k}" class="${theme === k ? "on" : ""}">${l}</button>`).join("")}</div></div>
-    <div class="field"><span>Projects live in</span>${cmdBox(st.home)}</div>`;
+    <div class="field"><span>Projects live in</span>${cmdBox(st.home)}
+      <div class="row"><button class="ghost small-btn" id="reviewFolders" type="button">Review project folders…</button></div></div>`;
+  $("reviewFolders").onclick = reviewFolders;
   const inst = st.install || {};
   const from = inst.channel === "branch" ? `the ${esc(inst.branch)} branch @ <code>${esc((inst.commit || "?").slice(0, 7))}</code>` : "releases on GitHub";
   $("setAbout").innerHTML = `<p class="small">decompdecomp ${esc(st.version)} on ${esc(st.platform)}. Free and open source (AGPL-3.0): <a class="link" href="https://github.com/n-delic/decompdecomp" target="_blank" rel="noopener">its source</a>. Everything runs on this computer: no account, nothing sent to us.</p>
@@ -499,4 +501,42 @@ async function refreshManualMcp() {
     }; });
   } catch(e) { if(read === manualMcpRead) showJobError(log,e.message); }
   finally { finish(); }
+}
+
+/* Every folder in the projects folder and what owns it, so leftovers (a removed project's folder, a cancelled
+   import's, a kept upload) can be deleted here, or opened and deleted by hand (app/storage.py). */
+const STORAGE_KINDS = { project: "Project", import: "Import in progress", leftover: "Nothing uses it", upload: "Kept game copy" };
+function bytesShown(n, exact = true) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${exact ? "" : "over "}${n.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+async function reviewFolders() {
+  dialog("Project folders", `<p class="muted small" id="storageNote">Looking at the projects folder…</p><div id="storageRows"></div>
+    <div class="row"><button class="ghost" data-close type="button">Close</button></div>`);
+  const note = $("storageNote"), box = $("storageRows");
+  let data;
+  try { data = await api("/api/storage"); } catch (e) { note.textContent = e.message; return; }
+  const leftovers = data.rows.filter((r) => r.kind === "leftover" || r.kind === "upload");
+  note.innerHTML = `Everything decompdecomp keeps is in <code>${esc(data.root)}</code>. ${leftovers.length
+    ? `<b>${plural(leftovers.length, "folder")}</b> nothing uses any more: delete them here, or open the folder and delete them by hand.`
+    : "No folder is left over."}`;
+  box.innerHTML = data.rows.map((r, i) => `<div class="row storage-row">
+      <span class="grow"><b>${esc(r.title || r.path.split(/[\/]/).pop())}</b> <span class="muted small">${esc(STORAGE_KINDS[r.kind] || r.kind)}${r.bytes != null ? ` · ${bytesShown(r.bytes, r.exact)}` : ""}</span><br><code class="small">${esc(r.path)}</code></span>
+      <button class="ghost small-btn" type="button" data-open="${i}">Open</button>
+      ${r.kind === "leftover" || r.kind === "upload" ? `<button class="ghost small-btn" type="button" data-del="${i}">Delete</button>` : ""}</div>`).join("");
+  box.querySelectorAll("[data-open]").forEach((b) => { b.onclick = async () => {
+    try { const res = await api("/api/storage/open", { method: "POST", body: { raw: data.rows[b.dataset.open].raw } }); if (!res.ok) toast(esc(res.message || "Couldn't open it."), "err"); } catch (e) { toast(esc(e.message), "err"); }
+  }; });
+  box.querySelectorAll("[data-del]").forEach((b) => { b.onclick = async () => {
+    const r = data.rows[b.dataset.del];
+    if (b.dataset.sure !== "1") { b.dataset.sure = "1"; b.textContent = "Delete for good?"; return; }  // (it can't be undone)
+    b.disabled = true;
+    try {
+      const res = await api("/api/storage/delete", { method: "POST", body: { raw: r.raw } });
+      if (res.deleted) { toast("Folder deleted."); reviewFolders(); }
+      else { toast(`Some files could not be deleted (in use?). Open the folder and delete it by hand: ${esc(r.path)}`, "err"); b.disabled = false; }
+    } catch (e) { toast(esc(e.message), "err"); b.disabled = false; }
+  }; });
 }

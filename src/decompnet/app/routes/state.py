@@ -20,7 +20,7 @@ from ... import __version__, consoles, hostenv, linuxvm, toolchains
 from ...agents.api import API_PRESETS
 from ...forks.project import SCOPES
 from ...network import NetworkError
-from .. import cleanup, edition, picker, saves, updates
+from .. import cleanup, edition, picker, saves, storage, updates
 from ..engine import COMPILERS, TOOLS
 from ..engine.importing import folder_targets
 from ..imports import ACTIVE, RESUMABLE, Imports
@@ -460,6 +460,46 @@ def register(app: App) -> None:
             return bad
         j = await call(imports.get, request.query_params.get("id", ""))
         return JSONResponse(j) if j else fail(ValueError("no such import"), 404)
+
+    @mcp.custom_route("/api/storage", methods=["GET"])
+    async def api_storage(request: Request) -> Response:
+        """Settings' review of the projects folder: each folder and what owns it (app/storage.py)."""
+        if (bad := guard(request)):
+            return bad
+        out = await call(storage.scan, net, imports)
+        return JSONResponse(out | {"root": hostenv.shown_path(Path(out["root"])),
+                                   "rows": [r | {"path": hostenv.shown_path(Path(r["path"])), "raw": r["path"]}
+                                            for r in out["rows"]]})
+
+    @mcp.custom_route("/api/storage/delete", methods=["POST"])
+    async def api_storage_delete(request: Request) -> Response:
+        """Delete one leftover folder (never a project's, an import's, or the app's own data)."""
+        if (bad := guard(request, write=True)):
+            return bad
+        raw = str((await body(request)).get("raw") or "")
+
+        def work() -> dict:
+            target = storage.deletable(net, imports, Path(raw))
+            failed = storage.remove_tree(target)
+            storage.prune_empty(target, Path(net.workspace))
+            return {"deleted": not target.exists(), "failed": failed}
+        try:
+            return JSONResponse(await call(work))
+        except ValueError as e:
+            return fail(e)
+
+    @mcp.custom_route("/api/storage/open", methods=["POST"])
+    async def api_storage_open(request: Request) -> Response:
+        if (bad := guard(request, write=True)):
+            return bad
+        folder = Path(str((await body(request)).get("raw") or ""))
+        try:
+            if not folder.is_dir() or not folder.resolve().is_relative_to(Path(net.workspace).resolve()):
+                raise ValueError("That folder isn't one decompdecomp keeps projects in.")
+        except (OSError, ValueError) as e:
+            return fail(ValueError(str(e)))
+        why = await call(hostenv.open_folder, folder)
+        return JSONResponse({"ok": why is None, "message": why})
 
     @mcp.custom_route("/api/import/resume", methods=["POST"])
     async def api_import_resume(request: Request) -> Response:
