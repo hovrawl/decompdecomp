@@ -1483,3 +1483,33 @@ def test_removing_a_project_with_its_folder_prunes_empty_batch_folders_and_says_
     assert storage.remove_tree(folder) == [str(folder / "held.bin")]
     with net.store.tx() as db:
         db.execute("DELETE FROM projects WHERE slug='rm-game'")
+
+
+def test_a_running_import_says_when_it_last_spoke_and_what_analyses_are_kept(app, tmp_path, monkeypatch):
+    """A big program is silent in Ghidra for up to an hour and nothing else is on disk until all are done: the import
+    page shows the job's last output and the analyses kept, so a user can tell a quiet import from a dead one."""
+    from decompnet import consoles
+
+    client, net, _ = app
+    params, headers = _two_games(tmp_path), {"X-Decomp": "1"}
+    kept = net.workspace / ".decomp" / "analysis"
+    kept.mkdir(parents=True, exist_ok=True)
+    (kept / "aaaa.json").write_text("[]")
+    entered, release = threading.Event(), threading.Event()
+
+    def quiet(self, net_, path, *, log, **kwargs):
+        log("[1 of 2] analysing a.dll")
+        entered.set()
+        release.wait(5)
+        return path.stem
+
+    monkeypatch.setattr(consoles.Console, "import_game", quiet)
+    monkeypatch.setattr(net, "start_autopilot", lambda slug: None)
+    imp = client.post("/api/import", params=params, headers=headers).json()["import"]
+    entered.wait(5)
+    j = client.get("/api/import/status", params={"id": imp}).json()
+    assert j["job_last"] >= j["job_started"] and j["now"] >= j["job_last"]
+    assert j["analysis"]["count"] == 1 and j["analysis"]["newest"] and j["analysis"]["folder"]
+    release.set()
+    _until(client, imp, {"done"})
+    (kept / "aaaa.json").unlink()

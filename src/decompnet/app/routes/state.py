@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -453,13 +454,25 @@ def register(app: App) -> None:
             return bad
         return JSONResponse([{k: v for k, v in d.items() if k != "log"} for d in await call(imports.pending)])
 
+    def liveness(j: dict) -> dict:
+        """What shows a long import is alive: when its job last said anything, and the analyses kept on disk (a big
+        game's Ghidra step is silent for up to an hour, and nothing else is written until every program is done)."""
+        job = jobs.jobs.get(j.get("job") or "") or {}
+        kept = home / "analysis"
+        files = [f for f in kept.glob("*.json")] if kept.is_dir() else []
+        newest = max((f.stat().st_mtime for f in files if f.exists()), default=None)
+        return j | {"now": time.time(), "job_last": job.get("last") or job.get("t"), "job_started": job.get("t"),
+                    "analysis": {"count": len(files), "newest": newest, "folder": hostenv.shown_path(kept)} if files else None}
+
     @mcp.custom_route("/api/import/status", methods=["GET"])
     async def api_import_status(request: Request) -> Response:
         """One import with its diagnostics: the page follows it from here (and its job, for the live log)."""
         if (bad := guard(request)):
             return bad
         j = await call(imports.get, request.query_params.get("id", ""))
-        return JSONResponse(j) if j else fail(ValueError("no such import"), 404)
+        if not j:
+            return fail(ValueError("no such import"), 404)
+        return JSONResponse(await call(liveness, j))
 
     @mcp.custom_route("/api/storage", methods=["GET"])
     async def api_storage(request: Request) -> Response:
