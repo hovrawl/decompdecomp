@@ -584,6 +584,7 @@ function renderImportPage(j, lines) {
   $("impFolder").textContent = j.kind === "folder"
     ? [j.parent && `New projects go in ${j.parent}`, doneCount && `${doneCount} imported`, (j.failures || []).length && `${j.failures.length} failed: ${j.failures.join(", ")}`].filter(Boolean).join(" · ")
     : j.source ? `From ${j.source}` : "";
+  renderImportPulse(j, lines, live);
   $("impResume").hidden = !stopped;
   $("impCancel").textContent = stopped ? "Remove import" : "Cancel import";
   $("impCancel").disabled = j.state === "cancelling";
@@ -593,6 +594,39 @@ function renderImportPage(j, lines) {
     const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
     log.textContent = text;
     if (atEnd) log.scrollTop = log.scrollHeight;
+  }
+}
+
+/* A long import must show it is alive: the step it is on ("[3 of 18]" in the log), when it last said anything, how
+   long it has run, and the analyses kept on disk (the project folder stays empty until every program is analysed). */
+const IMPORT_QUIET_S = 600;
+function spanShown(s) {
+  s = Math.max(0, Math.round(s));
+  if (s < 90) return `${s} s`;
+  const m = Math.round(s / 60);
+  return m < 90 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+}
+function renderImportPulse(j, lines, live) {
+  const step = [...lines].reverse().map((l) => l.match(/\[(\d+) of (\d+)\]/)).find(Boolean);
+  $("impSteps").hidden = $("impStep").hidden = !(step && live);
+  if (step && live) {
+    const [, n, of] = step.map(Number);
+    $("impSteps").firstElementChild.style.width = `${(Math.max(n - 1, 0) / of * 100).toFixed(1)}%`;
+    $("impStep").textContent = `Program ${n} of ${of} is being analysed (${n - 1} done)`;
+  }
+  const parts = [];
+  const quiet = j.job_last ? j.now - j.job_last : 0;
+  if (live && j.job_started) parts.push(`Running for ${spanShown(j.now - j.job_started)}`);
+  if (live && j.job_last) parts.push(`last output ${spanShown(quiet)} ago`);
+  const a = j.analysis;
+  if (a) parts.push(`${a.count} program analyses saved${a.newest ? `, newest ${spanShown(j.now - a.newest)} ago` : ""} (${a.folder})`);
+  $("impPulse").textContent = parts.join(" · ");
+  const slow = live && quiet > IMPORT_QUIET_S;
+  $("impQuiet").hidden = !slow;
+  if (slow) {
+    $("impQuiet").textContent = `Nothing has been logged for ${spanShown(quiet)}. One big program can take close to an hour in Ghidra, so this can be normal: `
+      + (a?.newest ? "check that the newest analysis above keeps changing as programs finish. " : "")
+      + "If nothing changes for much longer, cancel and import again: the analyses already saved are reused.";
   }
 }
 

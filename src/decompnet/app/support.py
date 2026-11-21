@@ -113,6 +113,7 @@ class Jobs:
         def log(line: str) -> None:
             check_cancel()
             job["log"].append(str(line))
+            job["last"] = time.time()  # when it last said anything: the import page shows a quiet job as such
             logger.info("[%s %s] %s", kind, jid[:6], line)
 
         def check_cancel() -> None:
