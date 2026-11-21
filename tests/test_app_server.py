@@ -1263,3 +1263,33 @@ def test_compiler_profile_jobs_stream_progress_and_reuse_active_task(app, monkey
         release.set()
     bad = client.post('/api/compiler/test-default', headers={'X-Decomp': '1'}, json={**data, 'action': 'unsupported'})
     assert bad.status_code == 400
+
+
+def test_a_second_import_of_a_folder_already_being_imported_joins_the_first(app, tmp_path, monkeypatch):
+    """A real folder import ran twice at once (two jobs, each analysing every DLL with Ghidra): the second request
+    for a path that's being imported gets the first job back."""
+    import threading
+
+    from decompnet import consoles
+    from tests.test_pc import _tiny_program
+
+    client, net, _ = app
+    (tmp_path / "one.dll").write_bytes(_tiny_program(b"\xc3", 0x400000, dll=True))
+    release = threading.Event()
+    monkeypatch.setattr(consoles.Console, "import_game", lambda self, net, path, **kw: release.wait(10) and path.stem)
+    monkeypatch.setattr(net, "start_autopilot", lambda slug: None)
+    headers = {"X-Decomp": "1"}
+    params = {"path": str(tmp_path), "folder_layout": "combined", "confirmed": "1"}
+    try:
+        first = client.post("/api/import", params=params, headers=headers).json()
+        second = client.post("/api/import", params=params, headers=headers).json()
+        assert second["job"] == first["job"] and second["already_running"]
+    finally:
+        release.set()
+    for _ in range(200):
+        if client.get("/api/job", params={"id": first["job"]}).json()["state"] != "running":
+            break
+        time.sleep(0.02)
+    third = client.post("/api/import", params=params, headers=headers).json()
+    assert third["job"] != first["job"]  # (the first has ended: a retry starts afresh)
+    release.set()

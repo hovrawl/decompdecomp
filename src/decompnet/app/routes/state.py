@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import shutil
 import uuid
@@ -295,6 +296,8 @@ def register(app: App) -> None:
         return JSONResponse({"folder": True, "groups": [{"platform": c.name, "count": len(files)} for c, files in groups.items()],
                              "layout_choice": any(c.folder_has_layout_choice(files) for c, files in groups.items())})
 
+    importing: dict[str, str] = {}  # the path being imported -> its job (a second request for it joins that job)
+
     @mcp.custom_route("/api/import", methods=["POST"])
     async def api_import(request: Request) -> Response:
         """A game the user owns: the demo, an upload streamed to disk (discs are gigabytes), or a local path."""
@@ -373,7 +376,15 @@ def register(app: App) -> None:
             for imported in result.get("projects", [slug]):
                 autopilot(imported)
             return result
-        return JSONResponse({"job": jobs.start("import", work)})
+        key = None if uploaded or q.get("demo") == "1" else os.path.normcase(os.path.realpath(game))
+        if key and (running := importing.get(key)) and jobs.jobs.get(running, {}).get("state") == "running":
+            # the same folder or file is being imported: the second job would analyse every program again, so the
+            # request joins the first (the GUI follows the job it's given)
+            return JSONResponse({"job": running, "already_running": True})
+        job = jobs.start("import", work)
+        if key:
+            importing[key] = job
+        return JSONResponse({"job": job})
 
     COLUMN_KEYS = ("vram", "cc", "ccx")
     GZIP_FROM_BYTES = 4096  # smaller answers aren't worth compressing
