@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import shutil
 import uuid
@@ -22,6 +23,7 @@ from ...network import NetworkError
 from .. import cleanup, edition, picker, saves, updates
 from ..engine import COMPILERS, TOOLS
 from ..engine.importing import folder_targets
+from ..imports import ACTIVE, RESUMABLE, Imports
 from ..support import MAX_DISC, job_error, static_file
 from . import App
 
@@ -41,6 +43,8 @@ def register(app: App) -> None:
     net, mcp, home, mcp_url, build_id = app.net, app.mcp, app.home, app.mcp_url, app.build_id
     manager, jobs, settings, guard, call, body = app.manager, app.jobs, app.settings, app.guard, app.call, app.body
     fail = app.fail
+    imports = Imports(net.workspace)
+    imports.interrupt_running()
 
     def state() -> dict:
         tcs = [t for t in toolchains.status() if t["id"] in COMPILERS or t["id"] in TOOLS]
@@ -295,6 +299,8 @@ def register(app: App) -> None:
         return JSONResponse({"folder": True, "groups": [{"platform": c.name, "count": len(files)} for c, files in groups.items()],
                              "layout_choice": any(c.folder_has_layout_choice(files) for c, files in groups.items())})
 
+    importing: dict[str, str] = {}  # the path being imported -> its import (a second request for it joins that one)
+
     @mcp.custom_route("/api/import", methods=["POST"])
     async def api_import(request: Request) -> Response:
         """A game the user owns: the demo, an upload streamed to disk (discs are gigabytes), or a local path."""
@@ -353,27 +359,134 @@ def register(app: App) -> None:
                     shutil.rmtree(game.parent, ignore_errors=True)
                     return fail(e)
         uploaded = q.get("demo") != "1" and not q.get("path")
+        # recorded on disk before any work starts, so it can be followed, resumed or cancelled (app/imports.py)
+        params = {"toolchain": toolchain, "scope": scope, "options": options, "all_compilers": all_compilers,
+                  "accept": accept, "layout": layout, "name": name}
+        kind = "demo" if q.get("demo") == "1" else "folder" if layout is not None else "file"
+        key = None if uploaded or kind == "demo" else os.path.normcase(os.path.realpath(game))
+        if key and (running := imports.get(importing.get(key, ""))) and running["state"] in ACTIVE:
+            # the same folder or file is being imported: a second job would analyse every program again, so the
+            # request joins the first (the GUI follows the import it's given)
+            return JSONResponse({"job": running["job"], "import": running["id"], "already_running": True})
+        journal = imports.create(title=name, kind=kind, source="" if kind == "demo" else str(game), params=params,
+                                 uploaded=uploaded)
+        if key:
+            importing[key] = journal["id"]
+        return JSONResponse({"job": run_import(journal["id"]), "import": journal["id"]})
+
+    def run_import(iid: str) -> str:
+        """Start a recorded import, or resume one: the same code, from what its journal says."""
+        imports.begin_run(iid)
+        imports.update(iid, failures=[])
 
         def work(log):
+            def say(line):
+                log(line)  # (raises when the import was cancelled)
+                try:
+                    imports.log(iid, line)
+                except OSError:  # the journal is a convenience: a full disk must not fail the import
+                    pass
+            say.check_cancel, say.progress = log.check_cancel, log.progress
             try:
-                if layout is not None:
-                    result = net.import_folder(game, separate=layout == "separate", scope=scope, log=log)
+                result = execute_import(imports.get(iid), say)
+            except BaseException as e:  # noqa: BLE001  the journal always says how it ended
+                current = imports.get(iid) or {}
+                if current.get("state") == "cancelling":
+                    discard_import(current)
                 else:
-                    slug = net.import_rom(game, toolchain=toolchain, confirmed=True, name=name, log=log, scope=scope,
-                                         options=options)
-                    result = {"slug": slug}
-            finally:
-                if uploaded:
-                    shutil.rmtree(game.parent, ignore_errors=True)
-            slug = result["slug"]
-            if all_compilers:
-                net.install_compilers(slug, accept, retest=toolchain is None, log=log)
-            settings.data["last_project"] = slug
-            settings.save()
-            for imported in result.get("projects", [slug]):
-                autopilot(imported)
+                    imports.finish(iid, "failed", error=job_error(e, jobs.log_path))
+                raise
+            imports.finish(iid, "done", slug=result["slug"], projects=result.get("projects", [result["slug"]]),
+                           failures=result.get("failures", []))
+            imports.drop_upload(iid)
             return result
-        return JSONResponse({"job": jobs.start("import", work)})
+        jid = jobs.start("import", work)
+        imports.update(iid, job=jid)
+        return jid
+
+    def execute_import(j: dict, log) -> dict:
+        iid, p = j["id"], j["params"]
+        if j["kind"] == "demo":
+            game: Path | bytes | None = static_file("demo/demo-quest-64.z64")
+            if game is None:
+                raise NetworkError("the demo ROM is missing from this install")
+        else:
+            game = Path(j["source"])
+            if not game.exists():
+                raise NetworkError(f"{game} is gone: pick the game again to start a new import")
+
+        def game_done(name: str, slug: str | None) -> None:
+            current = imports.get(iid) or {}
+            if slug:
+                imports.update(iid, done={**current.get("done", {}), name: slug})
+            else:
+                imports.update(iid, failures=[*current.get("failures", []), name])
+        if j["kind"] == "folder":
+            result = net.import_folder(game, separate=p["layout"] == "separate", scope=p["scope"], log=log,
+                                       parent=Path(j["parent"]) if j.get("parent") else None, done=j.get("done"),
+                                       on_parent=lambda path: imports.update(iid, parent=str(path)), on_game=game_done)
+        else:
+            result = {"slug": net.import_rom(game, toolchain=p["toolchain"], confirmed=True, name=p["name"], log=log,
+                                             scope=p["scope"], options=p["options"])}
+        slug = result["slug"]
+        if p["all_compilers"]:
+            net.install_compilers(slug, p["accept"], retest=p["toolchain"] is None, log=log)
+        settings.data["last_project"] = slug
+        settings.save()
+        for imported in result.get("projects", [slug]):
+            autopilot(imported)
+        return result
+
+    def discard_import(j: dict) -> None:
+        """Forget an import. The projects a folder import already made stay; its folder goes when it holds none."""
+        parent = Path(j["parent"]) if j.get("parent") else None
+        if parent is not None and parent.is_dir():
+            made = [Path(r["root"]) for r in net.store.all("SELECT root FROM projects")]
+            if not any(root.is_relative_to(parent) for root in made):
+                shutil.rmtree(parent, ignore_errors=True)
+        imports.discard(j["id"])
+
+    @mcp.custom_route("/api/imports", methods=["GET"])
+    async def api_imports(request: Request) -> Response:
+        """Imports not finished (running, stopped by an error or by closing the app): the sidebar lists them."""
+        if (bad := guard(request)):
+            return bad
+        return JSONResponse([{k: v for k, v in d.items() if k != "log"} for d in await call(imports.pending)])
+
+    @mcp.custom_route("/api/import/status", methods=["GET"])
+    async def api_import_status(request: Request) -> Response:
+        """One import with its diagnostics: the page follows it from here (and its job, for the live log)."""
+        if (bad := guard(request)):
+            return bad
+        j = await call(imports.get, request.query_params.get("id", ""))
+        return JSONResponse(j) if j else fail(ValueError("no such import"), 404)
+
+    @mcp.custom_route("/api/import/resume", methods=["POST"])
+    async def api_import_resume(request: Request) -> Response:
+        if (bad := guard(request, write=True)):
+            return bad
+        j = await call(imports.get, str((await body(request)).get("id") or ""))
+        if not j:
+            return fail(ValueError("no such import"), 404)
+        if j["state"] not in RESUMABLE:
+            return fail(ValueError("only an import that stopped can be resumed"))
+        return JSONResponse({"job": await call(run_import, j["id"]), "import": j["id"]})
+
+    @mcp.custom_route("/api/import/cancel", methods=["POST"])
+    async def api_import_cancel(request: Request) -> Response:
+        """Stop a running import and forget it, or forget one that already stopped."""
+        if (bad := guard(request, write=True)):
+            return bad
+        j = await call(imports.get, str((await body(request)).get("id") or ""))
+        if not j:
+            return fail(ValueError("no such import"), 404)
+        if j["state"] in ACTIVE:
+            await call(lambda: imports.update(j["id"], state="cancelling"))
+            if not jobs.cancel(j["job"] or ""):  # (its job is gone: the app was restarted, or it just ended)
+                await call(discard_import, j)
+            return JSONResponse({"cancelling": True})
+        await call(discard_import, j)
+        return JSONResponse({"cancelling": False})
 
     COLUMN_KEYS = ("vram", "cc", "ccx")
     GZIP_FROM_BYTES = 4096  # smaller answers aren't worth compressing

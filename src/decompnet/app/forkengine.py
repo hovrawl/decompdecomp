@@ -2797,6 +2797,8 @@ class ForkEngine:
     def background_draft(self, proj, fn) -> str | None:
         """One function's machine draft, made for the background drafter (and cached, as when a brief asks)."""
         _, fp, cfg = self.get(proj["slug"])
+        if not (fp.root / "objdiff.json").is_file():
+            return None  # not set up yet (an import still running, or interrupted): nothing to draft from
         unit = fp.unit(fn["unit"])
         return self._draft(proj, fp, cfg, fn, unit) if unit.source else None
 

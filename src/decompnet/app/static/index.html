@@ -495,6 +495,22 @@
 </main>
 
 <!-- ================================================================ compilers & tools -->
+<!-- ================================================================ an import in progress (app/imports.py) -->
+<main id="importPage" class="view" hidden>
+  <header class="page-head"><p class="eyebrow" id="impKind">Importing</p><h1 id="impTitle"></h1>
+    <p class="muted" id="impState"></p></header>
+  <div class="workbar" id="impPageBar" role="progressbar" aria-label="Importing project" hidden><i></i></div>
+  <p class="err-msg" id="impError" role="alert" hidden></p>
+  <p class="muted small" id="impFolder"></p>
+  <div class="row">
+    <button class="primary" id="impResume" type="button" hidden>Resume import</button>
+    <button class="ghost" id="impCancel" type="button">Cancel import</button>
+    <button class="ghost" id="impCopy" type="button">Copy for a bug report</button>
+  </div>
+  <h2 class="small">Diagnostics</h2>
+  <pre class="joblog" id="impLog"></pre>
+</main>
+
 <main id="toolsPage" class="view" hidden>
   <header class="page-head"><p class="eyebrow">Compilers &amp; tools</p><h1>What builds your games</h1>
     <p class="muted">decompdecomp installs what a project needs by itself. Proprietary compilers (IDO, CodeWarrior, Visual C++) are only installed when you accept that.</p></header>
