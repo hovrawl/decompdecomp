@@ -569,6 +569,7 @@ async function pollImport(id) {
 
 function renderImportPage(j, lines) {
   const stopped = j.state === "failed" || j.state === "interrupted";
+  const live = j.state === "running" || j.state === "cancelling";
   const doneCount = Object.keys(j.done || {}).length;
   $("impKind").textContent = j.kind === "folder" ? "Importing a folder" : "Importing a game";
   $("impTitle").textContent = j.title;
@@ -640,13 +641,23 @@ $("impResume").onclick = async () => {
     pollImport(id);
   } catch (e) { toast(esc(e.message), "err"); } finally { $("impResume").disabled = false; }
 };
-$("impCancel").onclick = async () => {
-  const id = impId;
-  if (!id) return;
-  try {
-    const res = await api("/api/import/cancel", { method: "POST", body: { id } });
-    if (res.cancelling) { clearTimeout(impTimer); pollImport(id); } else { loadNav(); location.hash = "#/"; }
-  } catch (e) { toast(esc(e.message), "err"); }
+$("impCancel").onclick = () => {
+  const id = impId, j = impLast?.j;
+  if (!id || !j) return;
+  const running = j.state === "running";
+  dialog(running ? "Cancel this import?" : "Remove this import?", `<p>${running
+      ? "The work in progress stops and is thrown away."
+      : "This forgets the paused import and cleans up what it left half-made."}
+    ${j.kind === "folder" ? "Projects already made from this folder stay. " : ""}${j.analysis
+      ? "The program analyses already saved are kept: importing the same folder again reuses them." : ""}</p>
+    <div class="row"><button class="primary" id="impCancelGo" type="button">${running ? "Cancel import" : "Remove import"}</button><button class="ghost" data-close type="button">Keep it</button></div>`);
+  $("impCancelGo").onclick = async () => {
+    try {
+      const res = await api("/api/import/cancel", { method: "POST", body: { id } });
+      closeDialog();
+      if (res.cancelling) { clearTimeout(impTimer); pollImport(id); } else { loadNav(); location.hash = "#/"; }
+    } catch (e) { toast(esc(e.message), "err"); }
+  };
 };
 $("impCopy").onclick = async () => {
   if (!impLast) return;
