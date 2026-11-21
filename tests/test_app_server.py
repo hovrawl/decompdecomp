@@ -1418,3 +1418,68 @@ def test_a_second_import_of_a_folder_already_being_imported_joins_the_first(app,
     third = client.post("/api/import", params=params, headers=headers).json()
     assert third["job"] != first["job"]  # (the first has ended: a retry starts afresh)
     release.set()
+
+
+# ---------------------------------------------------------------- reviewing and deleting what is left on disk (app/storage.py)
+
+
+def _project_row(net, slug, root):
+    with net.store.tx() as db:
+        db.execute("INSERT OR REPLACE INTO projects(slug,name,root,config) VALUES(?,?,?,?)", (slug, slug, str(root), "{}"))
+
+
+def test_storage_lists_projects_and_leftovers_and_deletes_only_leftovers(app):
+    client, net, _ = app
+    headers = {"X-Decomp": "1"}
+    owned, stray = net.workspace / "storage-owned", net.workspace / "storage-stray"
+    batch = net.workspace / "storage-batch" / "pc"
+    for folder in (owned, stray, batch / "inside", batch / "empty-leftover"):
+        folder.mkdir(parents=True)
+    (stray / "big.bin").write_bytes(b"x" * 2048)
+    _project_row(net, "storage-owned", owned)
+    _project_row(net, "storage-inside", batch / "inside")
+    rows = {r["raw"]: r for r in client.get("/api/storage").json()["rows"]}
+    assert rows[str(owned)]["kind"] == "project" and rows[str(owned)]["slug"] == "storage-owned"
+    assert rows[str(batch / "inside")]["kind"] == "project"  # (found inside a folder import's batch folder)
+    assert rows[str(stray)]["kind"] == "leftover" and rows[str(stray)]["bytes"] == 2048
+    assert rows[str(batch / "empty-leftover")]["kind"] == "leftover"
+    # what a project (or its parent) uses, and the app's own data, are refused
+    for refused in (owned, net.workspace / "storage-batch", net.workspace / ".decomp", net.workspace, net.workspace.parent):
+        bad = client.post("/api/storage/delete", json={"raw": str(refused)}, headers=headers)
+        assert bad.status_code == 400 and refused.exists(), refused
+    ok = client.post("/api/storage/delete", json={"raw": str(stray)}, headers=headers).json()
+    assert ok == {"deleted": True, "failed": []} and not stray.exists()
+    assert client.post("/api/storage/delete", json={"raw": str(batch / "empty-leftover")}, headers=headers).json()["deleted"]
+    assert (batch / "inside").exists()
+    for slug in ("storage-owned", "storage-inside"):
+        with net.store.tx() as db:
+            db.execute("DELETE FROM projects WHERE slug=?", (slug,))
+
+
+def test_removing_a_project_with_its_folder_prunes_empty_batch_folders_and_says_what_is_left(app, monkeypatch):
+    from decompnet.app import storage
+
+    client, net, manager = app
+    headers = {"X-Decomp": "1"}
+    folder = net.workspace / "rm-batch" / "pc" / "rm-game"
+    folder.mkdir(parents=True)
+    (folder / "orig.bin").write_bytes(b"1")
+    _project_row(net, "rm-game", folder)
+    monkeypatch.setattr(net, "remove_project", lambda slug: None)
+    monkeypatch.setattr(manager, "forget_project", lambda slug: None)
+    res = client.post("/api/delete", json={"slug": "rm-game", "files": True}, headers=headers).json()
+    assert res["deleted_files"] and res["left"] == [] and res["folder"] == str(folder)
+    assert not (net.workspace / "rm-batch").exists()  # the batch folder it left empty goes too
+    # a file that cannot be deleted is reported, not hidden
+    folder.mkdir(parents=True)
+    (folder / "held.bin").write_bytes(b"1")
+    def locked(path, onexc=None):  # (a file another program holds open: deleting it fails, even after chmod)
+        def fails(name):
+            raise OSError("in use")
+        onexc(fails, str(folder / "held.bin"), None)
+
+    monkeypatch.setattr(storage.shutil, "rmtree", locked)
+    monkeypatch.setattr(storage.os, "chmod", lambda *a: None)
+    assert storage.remove_tree(folder) == [str(folder / "held.bin")]
+    with net.store.tx() as db:
+        db.execute("DELETE FROM projects WHERE slug='rm-game'")

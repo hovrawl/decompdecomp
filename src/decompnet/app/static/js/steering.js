@@ -910,15 +910,21 @@ function renderCompilerWaiting(ov) {
   setHtml($("compilerWaiting"), sg.length ? `<p class="col-title">Waiting for you</p>${sg.map(suggestionHtml).join("")}` : "");
 }
 $("deleteBtn").onclick = () => {
+  const folder = S.ov.folder || "";
   dialog("Remove project", `<p>Remove <b>${esc(S.ov.title)}</b> from decompdecomp? Matched functions and notes are deleted.</p>
-    <label class="check"><input type="checkbox" id="delFiles"><span>Also delete the project folder (your ROM copy and exported sources in it)</span></label>
+    <label class="check"><input type="checkbox" id="delFiles"><span>Also delete the project folder from disk (your copy of the game, the analysis and exported sources in it)${folder ? `:<br><code>${esc(folder)}</code>` : ""}</span></label>
+    <p class="muted small">Left unticked, the folder stays on disk: Settings → Review project folders lists it so you can delete it later.</p>
     <div class="row"><button class="primary" id="delGo" type="button">Remove</button><button class="ghost" data-close type="button">Cancel</button></div>`);
   $("delGo").onclick = async () => {
     try {
-      await api("/api/delete", { method: "POST", body: { slug: S.slug, files: $("delFiles").checked } });
+      const res = await api("/api/delete", { method: "POST", body: { slug: S.slug, files: $("delFiles").checked } });
       closeDialog();
       loadNav();
       location.hash = "#/";
+      if (res.left?.length) {  // a file another program holds open can't be deleted: say which, never hide it
+        toast(`Project removed, but ${res.left.length} file(s) could not be deleted (in use?). Delete the folder by hand: ${esc(res.folder)}`, "err");
+      } else if (res.deleted_files) toast("Project and its folder removed.");
+      else toast(`Project removed. Its folder is still at ${esc(res.folder)}`);
     } catch (e) { toast(esc(e.message), "err"); }
   };
 };
